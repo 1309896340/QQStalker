@@ -1,19 +1,18 @@
 {
-    // 使用 IntelliSense 了解相关属性。 
-    // 悬停以查看现有属性的描述。
-    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "name": "解析data目录下消息到数据库",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/src/import_export.py",
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}/src"
-            },
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal"
-        }
-    ]
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Import QQ chat archive",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "src.import_export",
+      "args": [
+        "${workspaceFolder}/data/电影迷交流群"
+      ],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
 }

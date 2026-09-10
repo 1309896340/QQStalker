@@ -1,4 +1,4 @@
-"""Import a QQChatExporter JSON document and referenced binary resources into PostgreSQL."""
+"""Import one archived QQChatExporter directory into PostgreSQL."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import orjson
 from sqlalchemy import Engine, URL
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from models import (
+from src.models import (
     BinaryResource,
     Chat,
     ChatMembership,
@@ -25,9 +25,9 @@ from models import (
     MessageResource,
     Participant,
 )
-from parse_export import default_images_dir
-from schemas.qq_export import MessageResource as ExportedResource
-from schemas.qq_export import QQChatExport, QQMessage
+from src.parse_export import default_images_dir
+from src.schemas.qq_export import MessageResource as ExportedResource
+from src.schemas.qq_export import QQChatExport, QQMessage
 
 BATCH_SIZE = 500
 
@@ -403,9 +403,26 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
         return imported_messages, skipped_messages
 
 
+def find_export_json(archive_dir: Path) -> Path:
+    """Return the single JSON export stored directly in an archive directory."""
+
+    if not archive_dir.is_dir():
+        raise FileNotFoundError(f"Archive directory does not exist: {archive_dir}")
+    json_files = sorted(archive_dir.glob("*.json"))
+    if len(json_files) != 1:
+        raise ValueError(
+            f"Expected exactly one JSON export in {archive_dir}, found {len(json_files)}."
+        )
+    return json_files[0]
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("json_path", type=Path, help="Path to a QQChatExporter JSON file")
+    parser.add_argument(
+        "archive_dir",
+        type=Path,
+        help="Directory containing one QQChatExporter JSON file and resources/",
+    )
     parser.add_argument(
         "--images-dir",
         type=Path,
@@ -416,8 +433,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argument_parser().parse_args()
-    images_dir = args.images_dir or default_images_dir(args.json_path)
-    imported, skipped = synchronize_export(args.json_path, images_dir, create_database_engine())
+    json_path = find_export_json(args.archive_dir)
+    images_dir = args.images_dir or default_images_dir(json_path)
+    imported, skipped = synchronize_export(json_path, images_dir, create_database_engine())
     print(f"Import complete: {imported} messages inserted, {skipped} messages already present.")
 
 

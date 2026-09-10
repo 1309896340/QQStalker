@@ -7,7 +7,7 @@ from pathlib import Path
 
 import orjson
 
-from schemas import QQChatExport
+from src.schemas import QQChatExport
 
 
 def parse_export(json_path: Path) -> QQChatExport:
