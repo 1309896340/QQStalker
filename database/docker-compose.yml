@@ -6,7 +6,7 @@ services:
     env_file:
       - ../.env
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "8002:5432"
     volumes:
       # PostgreSQL 18 stores its data beneath /var/lib/postgresql.
       - postgres_data:/var/lib/postgresql

@@ -14,7 +14,7 @@ import orjson
 from sqlalchemy import Engine, URL
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from src.models import (
+from models import (
     BinaryResource,
     Chat,
     ChatMembership,
@@ -25,9 +25,9 @@ from src.models import (
     MessageResource,
     Participant,
 )
-from src.parse_export import default_images_dir
-from src.schemas.qq_export import MessageResource as ExportedResource
-from src.schemas.qq_export import QQChatExport, QQMessage
+from parse_export import default_images_dir
+from schemas.qq_export import MessageResource as ExportedResource
+from schemas.qq_export import QQChatExport, QQMessage
 
 BATCH_SIZE = 500
 
