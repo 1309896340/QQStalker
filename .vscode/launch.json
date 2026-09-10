@@ -43,6 +43,23 @@
       "envFile": "${workspaceFolder}/.env",
       "console": "integratedTerminal",
       "justMyCode": true
+    },
+    {
+      "name": "将群员画像 HTML 渲染为 PNG",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "src.render_html_png",
+      "args": [
+        "${workspaceFolder}/analysis/20260911003736_群员画像.html",
+        "${workspaceFolder}/analysis/20260911003736_群员画像.png",
+        "--dpi",
+        "300",
+        "--width-mm",
+        "210"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
     }
   ]
 }
