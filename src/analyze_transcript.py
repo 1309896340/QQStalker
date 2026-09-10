@@ -489,10 +489,23 @@ def render_html(analysis: str, *, source_path: Path, model: str) -> str:
 """
 
 
+def resolve_output_path(output_path: Path) -> Path:
+    """Use a timestamped HTML filename when the output argument is a directory."""
+
+    if output_path.suffix:
+        return output_path
+    filename = datetime.now().strftime("%Y%m%d%H%M%S_群员画像.html")
+    return output_path / filename
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input_markdown", type=Path, help="待分析的消息记录 Markdown 文件")
-    parser.add_argument("output_html", type=Path, help="群员画像 HTML 输出路径")
+    parser.add_argument(
+        "output_html",
+        type=Path,
+        help="HTML 输出路径；传入目录时自动生成带时间戳的文件名",
+    )
     parser.add_argument(
         "--env-file",
         type=Path,
@@ -510,6 +523,7 @@ def main() -> None:
     try:
         load_dotenv(args.env_file)
         model = required_setting("LLM_MODEL")
+        output_path = resolve_output_path(args.output_html)
         analysis = analyze_all_members(
             args.input_markdown.read_text(encoding="utf-8"),
             base_url=required_setting("LLM_BASE_URL"),
@@ -528,15 +542,15 @@ def main() -> None:
                 DEFAULT_MAX_INPUT_CHARACTERS,
             ),
         )
-        args.output_html.parent.mkdir(parents=True, exist_ok=True)
-        args.output_html.write_text(
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
             render_html(analysis, source_path=args.input_markdown, model=model),
             encoding="utf-8",
         )
     except (FileNotFoundError, RuntimeError, ValueError) as error:
         raise SystemExit(str(error)) from error
 
-    print(f"群员画像已写入：{args.output_html.resolve()}")
+    print(f"群员画像已写入：{output_path.resolve()}")
 
 
 if __name__ == "__main__":

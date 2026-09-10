@@ -37,7 +37,7 @@
       "module": "src.analyze_transcript",
       "args": [
         "${workspaceFolder}/exports/20260910233118_消息记录.md",
-        "${workspaceFolder}/analysis/群员画像.html"
+        "${workspaceFolder}/analysis"
       ],
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
