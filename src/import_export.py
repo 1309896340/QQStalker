@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import hashlib
+import logging
 import mimetypes
 import os
+import time
 from datetime import UTC, datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from uuid import UUID
 
@@ -30,6 +34,62 @@ from src.schemas.qq_export import MessageResource as ExportedResource
 from src.schemas.qq_export import QQChatExport, QQMessage
 
 BATCH_SIZE = 500
+PROGRESS_INTERVAL = 100
+DEFAULT_LOG_PATH = Path("logs") / "import_export.log"
+LOGGER = logging.getLogger("qqstalker.import_export")
+
+
+def configure_logging(log_file: Path, log_level: str) -> None:
+    """Send progress logs to both the terminal and a rotating file."""
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    level = getattr(logging, log_level.upper(), None)
+    if not isinstance(level, int):
+        raise ValueError(f"Unsupported log level: {log_level}")
+
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(name)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    file_handler = RotatingFileHandler(
+        log_file,
+        encoding="utf-8",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=3,
+    )
+    file_handler.setFormatter(formatter)
+
+    LOGGER.handlers.clear()
+    LOGGER.addHandler(console_handler)
+    LOGGER.addHandler(file_handler)
+    LOGGER.setLevel(level)
+    LOGGER.propagate = False
+    LOGGER.info("Logging initialized. File: %s", log_file.resolve())
+
+
+def start_stall_monitor(log_file: Path, timeout_seconds: int):
+    """Periodically dump all Python stacks if the importer stops making progress."""
+
+    if timeout_seconds == 0:
+        LOGGER.info("Stall monitor is disabled.")
+        return None
+
+    stack_log_path = log_file.with_name(f"{log_file.stem}.stacks.log")
+    stack_log = stack_log_path.open("a", encoding="utf-8", buffering=1)
+    faulthandler.dump_traceback_later(
+        timeout_seconds,
+        repeat=True,
+        file=stack_log,
+        exit=False,
+    )
+    LOGGER.info(
+        "Stall monitor enabled: thread stacks are written every %ds to %s.",
+        timeout_seconds,
+        stack_log_path.resolve(),
+    )
+    return stack_log
 
 
 def database_url_from_environment() -> str:
@@ -139,17 +199,21 @@ def get_or_create_binary_resource(
 ) -> UUID:
     resolved_path = file_path.resolve()
     if resolved_path in binary_file_ids:
+        LOGGER.debug("Reusing binary resource from path cache: %s", resolved_path)
         return binary_file_ids[resolved_path]
 
+    LOGGER.info("Reading binary resource: %s", resolved_path)
     content = file_path.read_bytes()
     checksum = hashlib.sha256(content).hexdigest()
     if checksum in binary_ids:
+        LOGGER.debug("Reusing binary resource from checksum cache: %s", checksum)
         return binary_ids[checksum]
 
     binary_resource = session.exec(
         select(BinaryResource).where(BinaryResource.sha256 == checksum)
     ).first()
     if binary_resource is None:
+        LOGGER.info("Creating binary resource: sha256=%s bytes=%d", checksum, len(content))
         binary_resource = BinaryResource(
             sha256=checksum,
             resource_type=resource.type,
@@ -159,6 +223,8 @@ def get_or_create_binary_resource(
             content=content,
         )
         session.add(binary_resource)
+    else:
+        LOGGER.info("Reusing binary resource from database: sha256=%s", checksum)
 
     binary_ids[checksum] = binary_resource.id
     binary_file_ids[resolved_path] = binary_resource.id
@@ -292,6 +358,13 @@ def synchronize_message(
             if resource_path is not None
             else None
         )
+        if resource_path is None:
+            LOGGER.debug(
+                "No local binary file for message=%s resource=%d type=%s",
+                message.id,
+                position,
+                resource.type,
+            )
         if resource.type == "image" and db_message.primary_binary_resource_id is None:
             db_message.primary_binary_resource_id = binary_resource_id
         session.add(
@@ -317,12 +390,29 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
     if not images_dir.is_dir():
         raise FileNotFoundError(f"Image resources directory does not exist: {images_dir}")
 
+    LOGGER.info("Reading JSON export: %s", json_path.resolve())
+    read_started = time.monotonic()
     source_bytes = json_path.read_bytes()
     source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    LOGGER.info(
+        "Read %d bytes in %.2fs; validating export schema.",
+        len(source_bytes),
+        time.monotonic() - read_started,
+    )
+    validation_started = time.monotonic()
     export = QQChatExport.model_validate(orjson.loads(source_bytes))
+    LOGGER.info(
+        "Validated %d messages in %.2fs.",
+        len(export.messages),
+        time.monotonic() - validation_started,
+    )
+
+    LOGGER.info("Creating database tables if needed.")
     SQLModel.metadata.create_all(engine)
+    LOGGER.info("Database tables are ready.")
 
     with Session(engine) as session, session.begin():
+        LOGGER.info("Starting database transaction for peer=%s.", export.chat_info.peer_uid)
         chat = session.exec(select(Chat).where(Chat.peer_uid == export.chat_info.peer_uid)).first()
         if chat is None:
             chat = Chat(
@@ -336,6 +426,7 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
             )
             session.add(chat)
             session.flush()
+            LOGGER.info("Created chat id=%s.", chat.id)
         else:
             chat.chat_type = export.chat_info.type
             chat.name = export.chat_info.name
@@ -344,6 +435,7 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
             chat.self_uin = export.chat_info.self_uin
             chat.self_name = export.chat_info.self_name
             chat.updated_at = datetime.now(UTC)
+            LOGGER.info("Updated chat id=%s.", chat.id)
 
         existing_batch = session.exec(
             select(ImportBatch).where(
@@ -352,6 +444,7 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
             )
         ).first()
         if existing_batch and existing_batch.completed_at:
+            LOGGER.info("This exact export was already imported; no work to perform.")
             return 0, 0
 
         batch = existing_batch or ImportBatch(
@@ -365,10 +458,12 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
         )
         session.add(batch)
         session.flush()
+        LOGGER.info("Using import batch id=%s.", batch.id)
 
         existing_message_ids = set(
             session.exec(select(Message.external_id).where(Message.chat_id == chat.id)).all()
         )
+        LOGGER.info("Found %d existing messages for this chat.", len(existing_message_ids))
         participant_ids: dict[str, UUID] = {}
         binary_ids: dict[str, UUID] = {}
         binary_file_ids: dict[Path, UUID] = {}
@@ -376,10 +471,19 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
         imported_messages = 0
         skipped_messages = 0
 
-        for message in export.messages:
+        for source_index, message in enumerate(export.messages, start=1):
             if message.id in existing_message_ids:
                 skipped_messages += 1
                 continue
+            if source_index == 1 or source_index % PROGRESS_INTERVAL == 0:
+                LOGGER.info(
+                    "Processing message %d/%d (id=%s); inserted=%d skipped=%d.",
+                    source_index,
+                    len(export.messages),
+                    message.id,
+                    imported_messages,
+                    skipped_messages,
+                )
             synchronize_message(
                 session,
                 message,
@@ -394,12 +498,24 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
             )
             imported_messages += 1
             if imported_messages % BATCH_SIZE == 0:
+                flush_started = time.monotonic()
+                LOGGER.info("Flushing after %d inserted messages.", imported_messages)
                 session.flush()
                 session.expunge_all()
+                LOGGER.info(
+                    "Flush completed in %.2fs after source message %d.",
+                    time.monotonic() - flush_started,
+                    source_index,
+                )
 
         batch = session.get(ImportBatch, batch.id)
         assert batch is not None
         batch.completed_at = datetime.now(UTC)
+        LOGGER.info(
+            "Import transaction is ready to commit: inserted=%d skipped=%d.",
+            imported_messages,
+            skipped_messages,
+        )
         return imported_messages, skipped_messages
 
 
@@ -428,15 +544,53 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Image directory (defaults to <json parent>/resources/images)",
     )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=DEFAULT_LOG_PATH,
+        help="Log file path (default: logs/import_export.log)",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="Minimum log severity (default: INFO)",
+    )
+    parser.add_argument(
+        "--stall-timeout",
+        type=int,
+        default=300,
+        help="Seconds before writing thread stacks; use 0 to disable (default: 300)",
+    )
     return parser
 
 
 def main() -> None:
     args = build_argument_parser().parse_args()
-    json_path = find_export_json(args.archive_dir)
-    images_dir = args.images_dir or default_images_dir(json_path)
-    imported, skipped = synchronize_export(json_path, images_dir, create_database_engine())
-    print(f"Import complete: {imported} messages inserted, {skipped} messages already present.")
+    if args.stall_timeout < 0:
+        raise SystemExit("--stall-timeout must be zero or greater")
+    configure_logging(args.log_file, args.log_level)
+    stack_log = start_stall_monitor(args.log_file, args.stall_timeout)
+    try:
+        json_path = find_export_json(args.archive_dir)
+        images_dir = args.images_dir or default_images_dir(json_path)
+        LOGGER.info("Archive directory: %s", args.archive_dir.resolve())
+        LOGGER.info("Image directory: %s", images_dir.resolve())
+        LOGGER.info(
+            "Creating database engine for host=%s port=%s database=%s.",
+            os.getenv("POSTGRES_HOST", "localhost"),
+            os.getenv("POSTGRES_PORT", "5432"),
+            os.getenv("POSTGRES_DB", "qqstalker"),
+        )
+        imported, skipped = synchronize_export(json_path, images_dir, create_database_engine())
+    except Exception:
+        LOGGER.exception("Import failed. The preceding log entry identifies the last completed step.")
+        raise
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        if stack_log is not None:
+            stack_log.close()
+    LOGGER.info("Import complete: %d messages inserted, %d already present.", imported, skipped)
 
 
 if __name__ == "__main__":
