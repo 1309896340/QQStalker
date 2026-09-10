@@ -17,6 +17,8 @@ def parse_export(json_path: Path) -> QQChatExport:
 
 
 def default_images_dir(json_path: Path) -> Path:
+    """Return the standard image-resource directory for an exported JSON file."""
+
     return json_path.parent / "resources" / "images"
 
 

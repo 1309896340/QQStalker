@@ -9,6 +9,7 @@ dependencies = [
     "pydantic>=2.13.5",
     "psycopg[binary]>=3.3.3",
     "sqlmodel>=0.0.42",
+    "httpx>=0.28.1",
 ]
 
 [dependency-groups]

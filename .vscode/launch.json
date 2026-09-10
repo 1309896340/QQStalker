@@ -2,12 +2,42 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Import QQ chat archive",
+      "name": "读取json上传数据库",
       "type": "debugpy",
       "request": "launch",
       "module": "src.import_export",
       "args": [
         "${workspaceFolder}/data/电影迷交流群"
+      ],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "从数据库筛选导出消息记录",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "src.export_markdown",
+      "args": [
+        "2026-09-09",
+        "${workspaceFolder}/exports",
+        "--end-date",
+        "2026-09-10"
+      ],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "AI 分析群员画像",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "src.analyze_transcript",
+      "args": [
+        "${workspaceFolder}/exports/20260910233118_消息记录.md",
+        "${workspaceFolder}/analysis/群员画像.html"
       ],
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
