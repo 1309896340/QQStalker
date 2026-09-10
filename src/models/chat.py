@@ -1,12 +1,10 @@
 """Normalized SQLModel entities for imported QQ chat exports."""
 
-from __future__ import annotations
-
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Column, JSON, UniqueConstraint
+from sqlalchemy import Column, JSON, LargeBinary, UniqueConstraint
 from sqlmodel import Field, Relationship, SQLModel
 
 
@@ -33,7 +31,7 @@ class ImportBatch(SQLModel, table=True):
     completed_at: datetime | None = None
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
 
-    chat: Chat | None = Relationship(back_populates="import_batches")
+    chat: Optional["Chat"] = Relationship(back_populates="import_batches")
 
 
 class Chat(SQLModel, table=True):
@@ -53,8 +51,8 @@ class Chat(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now, nullable=False)
 
     import_batches: list[ImportBatch] = Relationship(back_populates="chat")
-    memberships: list[ChatMembership] = Relationship(back_populates="chat")
-    messages: list[Message] = Relationship(back_populates="chat")
+    memberships: list["ChatMembership"] = Relationship(back_populates="chat")
+    messages: list["Message"] = Relationship(back_populates="chat")
 
 
 class Participant(SQLModel, table=True):
@@ -70,8 +68,25 @@ class Participant(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utc_now, nullable=False)
     updated_at: datetime = Field(default_factory=utc_now, nullable=False)
 
-    memberships: list[ChatMembership] = Relationship(back_populates="participant")
-    sent_messages: list[Message] = Relationship(back_populates="sender")
+    memberships: list["ChatMembership"] = Relationship(back_populates="participant")
+    sent_messages: list["Message"] = Relationship(back_populates="sender")
+
+
+class BinaryResource(SQLModel, table=True):
+    """Deduplicated bytes for an image, audio file, video, or other attachment."""
+
+    __tablename__ = "binary_resources"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    sha256: str = Field(unique=True, index=True, max_length=64)
+    resource_type: str | None = Field(default=None, index=True)
+    original_filename: str | None = None
+    mime_type: str | None = None
+    byte_size: int
+    content: bytes = Field(sa_column=Column(LargeBinary, nullable=False))
+    created_at: datetime = Field(default_factory=utc_now, nullable=False)
+
+    references: list["MessageResource"] = Relationship(back_populates="binary_resource")
 
 
 class ChatMembership(SQLModel, table=True):
@@ -101,6 +116,11 @@ class Message(SQLModel, table=True):
     chat_id: UUID = Field(foreign_key="chats.id", index=True)
     sender_id: UUID | None = Field(default=None, foreign_key="participants.id", index=True)
     import_batch_id: UUID | None = Field(default=None, foreign_key="import_batches.id", index=True)
+    primary_binary_resource_id: UUID | None = Field(
+        default=None,
+        foreign_key="binary_resources.id",
+        index=True,
+    )
     external_id: str
     sequence: str | None = None
     message_type: str = Field(index=True)
@@ -114,10 +134,10 @@ class Message(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utc_now, nullable=False)
 
     chat: Chat = Relationship(back_populates="messages")
-    sender: Participant | None = Relationship(back_populates="sent_messages")
-    elements: list[MessageElement] = Relationship(back_populates="message")
-    resources: list[MessageResource] = Relationship(back_populates="message")
-    mentions: list[MessageMention] = Relationship(back_populates="message")
+    sender: Optional[Participant] = Relationship(back_populates="sent_messages")
+    elements: list["MessageElement"] = Relationship(back_populates="message")
+    resources: list["MessageResource"] = Relationship(back_populates="message")
+    mentions: list["MessageMention"] = Relationship(back_populates="message")
 
 
 class MessageElement(SQLModel, table=True):
@@ -143,6 +163,11 @@ class MessageResource(SQLModel, table=True):
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     message_id: UUID = Field(foreign_key="messages.id", index=True)
+    binary_resource_id: UUID | None = Field(
+        default=None,
+        foreign_key="binary_resources.id",
+        index=True,
+    )
     position: int
     resource_type: str | None = Field(default=None, index=True)
     resource_name: str | None = None
@@ -152,6 +177,7 @@ class MessageResource(SQLModel, table=True):
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
 
     message: Message = Relationship(back_populates="resources")
+    binary_resource: Optional[BinaryResource] = Relationship(back_populates="references")
 
 
 class MessageMention(SQLModel, table=True):

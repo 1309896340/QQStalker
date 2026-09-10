@@ -1,6 +1,7 @@
 """SQLModel ORM entities for normalized QQ chat imports."""
 
 from .chat import (
+    BinaryResource,
     Chat,
     ChatMembership,
     ImportBatch,
@@ -12,6 +13,7 @@ from .chat import (
 )
 
 __all__ = [
+    "BinaryResource",
     "Chat",
     "ChatMembership",
     "ImportBatch",

@@ -94,9 +94,14 @@ class MessageResource(ExportSchema):
     """A resource reference; image files remain in ``resources/images``."""
 
     type: str | None = None
+    filename: str | None = None
     name: str | None = None
     path: str | None = None
     url: str | None = None
+    local_path: str | None = Field(default=None, alias="localPath")
+    size: int | None = None
+    width: int | None = None
+    height: int | None = None
 
 
 class MessageMention(ExportSchema):
