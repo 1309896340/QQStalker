@@ -12,6 +12,7 @@ import time
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import orjson
@@ -37,6 +38,49 @@ BATCH_SIZE = 500
 PROGRESS_INTERVAL = 100
 DEFAULT_LOG_PATH = Path("logs") / "import_export.log"
 LOGGER = logging.getLogger("qqstalker.import_export")
+
+
+def sanitize_postgres_text(value: str | None, *, field_path: str) -> str | None:
+    """Remove NUL bytes, which PostgreSQL cannot store in text or JSON values."""
+
+    if value is None or "\x00" not in value:
+        return value
+
+    removed = value.count("\x00")
+    LOGGER.warning(
+        "Removed %d NUL byte(s) before database insert: %s.",
+        removed,
+        field_path,
+    )
+    return value.replace("\x00", "")
+
+
+def sanitize_postgres_json(value: Any, *, field_path: str) -> Any:
+    """Recursively remove PostgreSQL-incompatible NUL bytes from JSON data."""
+
+    if isinstance(value, str):
+        return sanitize_postgres_text(value, field_path=field_path)
+    if isinstance(value, dict):
+        sanitized: dict[Any, Any] = {}
+        for key, item in value.items():
+            sanitized_key = sanitize_postgres_text(str(key), field_path=f"{field_path}.<key>")
+            assert sanitized_key is not None
+            sanitized[sanitized_key] = sanitize_postgres_json(
+                item,
+                field_path=f"{field_path}.{sanitized_key}",
+            )
+        return sanitized
+    if isinstance(value, list):
+        return [
+            sanitize_postgres_json(item, field_path=f"{field_path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, tuple):
+        return [
+            sanitize_postgres_json(item, field_path=f"{field_path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    return value
 
 
 def configure_logging(log_file: Path, log_level: str) -> None:
@@ -169,10 +213,26 @@ def get_or_create_participant(
     nickname: str | None,
     participant_ids: dict[str, UUID],
 ) -> UUID:
+    sender_uid = sanitize_postgres_text(sender_uid, field_path="participant.uid") or ""
+    uin = sanitize_postgres_text(uin, field_path=f"participant[{sender_uid}].uin")
+    display_name = (
+        sanitize_postgres_text(
+            display_name,
+            field_path=f"participant[{sender_uid}].display_name",
+        )
+        or ""
+    )
+    nickname = sanitize_postgres_text(
+        nickname,
+        field_path=f"participant[{sender_uid}].nickname",
+    )
     if sender_uid in participant_ids:
         return participant_ids[sender_uid]
 
-    participant = session.exec(select(Participant).where(Participant.uid == sender_uid)).first()
+    with session.no_autoflush:
+        participant = session.exec(
+            select(Participant).where(Participant.uid == sender_uid)
+        ).first()
     if participant is None:
         participant = Participant(
             uid=sender_uid,
@@ -181,6 +241,8 @@ def get_or_create_participant(
             nickname=nickname,
         )
         session.add(participant)
+        # Mentions and memberships reference this row by UUID in the same transaction.
+        session.flush()
     else:
         participant.uin = uin or participant.uin
         participant.display_name = display_name
@@ -218,8 +280,16 @@ def get_or_create_binary_resource(
         LOGGER.info("Creating binary resource: sha256=%s bytes=%d", checksum, len(content))
         binary_resource = BinaryResource(
             sha256=checksum,
-            resource_type=resource.type,
-            original_filename=resource.filename or resource.name or file_path.name,
+            resource_type=sanitize_postgres_text(
+                resource.type,
+                field_path=f"binary_resource[{checksum}].resource_type",
+            )
+            or "unknown",
+            original_filename=sanitize_postgres_text(
+                resource.filename or resource.name or file_path.name,
+                field_path=f"binary_resource[{checksum}].original_filename",
+            )
+            or file_path.name,
             mime_type=mimetypes.guess_type(file_path.name)[0],
             byte_size=len(content),
             content=content,
@@ -241,6 +311,7 @@ def ensure_chat_membership(
     group_card: str | None,
     membership_keys: set[tuple[UUID, UUID]],
 ) -> None:
+    group_card = sanitize_postgres_text(group_card, field_path="chat_membership.group_card")
     key = (chat_id, participant_id)
     if key in membership_keys:
         return
@@ -280,6 +351,7 @@ def synchronize_message(
     binary_file_ids: dict[Path, UUID],
     membership_keys: set[tuple[UUID, UUID]],
 ) -> None:
+    message_path = f"message[{message.id}]"
     sender_id = get_or_create_participant(
         session,
         message.sender.uid,
@@ -300,16 +372,35 @@ def synchronize_message(
         chat_id=chat_id,
         sender_id=sender_id,
         import_batch_id=import_batch_id,
-        external_id=message.id,
+        external_id=sanitize_postgres_text(
+            message.id,
+            field_path=f"{message_path}.id",
+        )
+        or "",
         sequence=message.seq,
-        message_type=message.type,
+        message_type=sanitize_postgres_text(
+            message.type,
+            field_path=f"{message_path}.type",
+        )
+        or "unknown",
         sent_at=sent_at,
         source_timestamp_ms=message.timestamp,
-        text=message.content.text,
-        html=message.content.html,
+        text=sanitize_postgres_text(
+            message.content.text,
+            field_path=f"{message_path}.content.text",
+        )
+        or "",
+        html=sanitize_postgres_text(
+            message.content.html,
+            field_path=f"{message_path}.content.html",
+        )
+        or "",
         recalled=message.recalled,
         system=message.system,
-        raw_content_json=message.content.model_dump(by_alias=True, mode="json"),
+        raw_content_json=sanitize_postgres_json(
+            message.content.model_dump(by_alias=True, mode="json"),
+            field_path=f"{message_path}.content",
+        ),
     )
     session.add(db_message)
 
@@ -318,8 +409,15 @@ def synchronize_message(
             MessageElement(
                 message_id=db_message.id,
                 position=position,
-                element_type=element.type,
-                data_json=element.data,
+                element_type=sanitize_postgres_text(
+                    element.type,
+                    field_path=f"{message_path}.content.elements[{position}].type",
+                )
+                or "unknown",
+                data_json=sanitize_postgres_json(
+                    element.data,
+                    field_path=f"{message_path}.content.elements[{position}].data",
+                ),
             )
         )
 
@@ -337,9 +435,21 @@ def synchronize_message(
                 message_id=db_message.id,
                 participant_id=mentioned_participant_id,
                 position=position,
-                mentioned_uid=mention.uid,
-                display_name=mention.name,
-                mention_type=mention.type,
+                mentioned_uid=sanitize_postgres_text(
+                    mention.uid,
+                    field_path=f"{message_path}.content.mentions[{position}].uid",
+                )
+                or "",
+                display_name=sanitize_postgres_text(
+                    mention.name,
+                    field_path=f"{message_path}.content.mentions[{position}].name",
+                )
+                or "",
+                mention_type=sanitize_postgres_text(
+                    mention.type,
+                    field_path=f"{message_path}.content.mentions[{position}].type",
+                )
+                or "unknown",
             )
         )
 
@@ -374,12 +484,31 @@ def synchronize_message(
                 message_id=db_message.id,
                 binary_resource_id=binary_resource_id,
                 position=position,
-                resource_type=resource.type,
-                resource_name=resource.filename or resource.name,
-                resource_path=resource.local_path or resource.path,
-                resource_url=resource.url,
-                local_path=str(resource_path) if resource_path else None,
-                metadata_json=resource.model_dump(by_alias=True, mode="json"),
+                resource_type=sanitize_postgres_text(
+                    resource.type,
+                    field_path=f"{message_path}.content.resources[{position}].type",
+                )
+                or "unknown",
+                resource_name=sanitize_postgres_text(
+                    resource.filename or resource.name,
+                    field_path=f"{message_path}.content.resources[{position}].name",
+                ),
+                resource_path=sanitize_postgres_text(
+                    resource.local_path or resource.path,
+                    field_path=f"{message_path}.content.resources[{position}].local_path",
+                ),
+                resource_url=sanitize_postgres_text(
+                    resource.url,
+                    field_path=f"{message_path}.content.resources[{position}].url",
+                ),
+                local_path=sanitize_postgres_text(
+                    str(resource_path) if resource_path else None,
+                    field_path=f"{message_path}.content.resources[{position}].resolved_path",
+                ),
+                metadata_json=sanitize_postgres_json(
+                    resource.model_dump(by_alias=True, mode="json"),
+                    field_path=f"{message_path}.content.resources[{position}]",
+                ),
             )
         )
 
@@ -414,28 +543,71 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
     LOGGER.info("Database tables are ready.")
 
     with Session(engine) as session, session.begin():
-        LOGGER.info("Starting database transaction for peer=%s.", export.chat_info.peer_uid)
-        chat = session.exec(select(Chat).where(Chat.peer_uid == export.chat_info.peer_uid)).first()
+        peer_uid = (
+            sanitize_postgres_text(export.chat_info.peer_uid, field_path="chat_info.peer_uid")
+            or ""
+        )
+        LOGGER.info("Starting database transaction for peer=%s.", peer_uid)
+        chat = session.exec(select(Chat).where(Chat.peer_uid == peer_uid)).first()
         if chat is None:
             chat = Chat(
-                peer_uid=export.chat_info.peer_uid,
-                chat_type=export.chat_info.type,
-                name=export.chat_info.name,
-                avatar_url=export.chat_info.avatar,
-                self_uid=export.chat_info.self_uid,
-                self_uin=export.chat_info.self_uin,
-                self_name=export.chat_info.self_name,
+                peer_uid=peer_uid,
+                chat_type=sanitize_postgres_text(
+                    export.chat_info.type,
+                    field_path="chat_info.type",
+                )
+                or "unknown",
+                name=sanitize_postgres_text(
+                    export.chat_info.name,
+                    field_path="chat_info.name",
+                )
+                or "",
+                avatar_url=sanitize_postgres_text(
+                    export.chat_info.avatar,
+                    field_path="chat_info.avatar",
+                ),
+                self_uid=sanitize_postgres_text(
+                    export.chat_info.self_uid,
+                    field_path="chat_info.self_uid",
+                )
+                or "",
+                self_uin=sanitize_postgres_text(
+                    export.chat_info.self_uin,
+                    field_path="chat_info.self_uin",
+                ),
+                self_name=sanitize_postgres_text(
+                    export.chat_info.self_name,
+                    field_path="chat_info.self_name",
+                ),
             )
             session.add(chat)
             session.flush()
             LOGGER.info("Created chat id=%s.", chat.id)
         else:
-            chat.chat_type = export.chat_info.type
-            chat.name = export.chat_info.name
-            chat.avatar_url = export.chat_info.avatar
-            chat.self_uid = export.chat_info.self_uid
-            chat.self_uin = export.chat_info.self_uin
-            chat.self_name = export.chat_info.self_name
+            chat.chat_type = (
+                sanitize_postgres_text(export.chat_info.type, field_path="chat_info.type")
+                or "unknown"
+            )
+            chat.name = (
+                sanitize_postgres_text(export.chat_info.name, field_path="chat_info.name")
+                or ""
+            )
+            chat.avatar_url = sanitize_postgres_text(
+                export.chat_info.avatar,
+                field_path="chat_info.avatar",
+            )
+            chat.self_uid = sanitize_postgres_text(
+                export.chat_info.self_uid,
+                field_path="chat_info.self_uid",
+            ) or ""
+            chat.self_uin = sanitize_postgres_text(
+                export.chat_info.self_uin,
+                field_path="chat_info.self_uin",
+            )
+            chat.self_name = sanitize_postgres_text(
+                export.chat_info.self_name,
+                field_path="chat_info.self_name",
+            )
             chat.updated_at = datetime.now(UTC)
             LOGGER.info("Updated chat id=%s.", chat.id)
 
@@ -454,9 +626,20 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
             source_path=str(json_path.resolve()),
             source_sha256=source_sha256,
             source_size_bytes=len(source_bytes),
-            exporter_name=export.metadata.name,
-            exporter_version=export.metadata.version,
-            metadata_json=export.model_dump(by_alias=True, mode="json", exclude={"messages"}),
+            exporter_name=sanitize_postgres_text(
+                export.metadata.name,
+                field_path="metadata.name",
+            )
+            or "",
+            exporter_version=sanitize_postgres_text(
+                export.metadata.version,
+                field_path="metadata.version",
+            )
+            or "",
+            metadata_json=sanitize_postgres_json(
+                export.model_dump(by_alias=True, mode="json", exclude={"messages"}),
+                field_path="export_metadata",
+            ),
         )
         session.add(batch)
         session.flush()

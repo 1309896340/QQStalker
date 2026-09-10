@@ -10,3 +10,8 @@ dependencies = [
     "psycopg[binary]>=3.3.3",
     "sqlmodel>=0.0.42",
 ]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.414",
+]

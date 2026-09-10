@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Column, JSON, LargeBinary, UniqueConstraint
+from sqlalchemy import BigInteger, Column, JSON, LargeBinary, UniqueConstraint
 from sqlmodel import Field, Relationship, SQLModel
 
 
@@ -15,7 +15,7 @@ def utc_now() -> datetime:
 class ImportBatch(SQLModel, table=True):
     """One immutable import attempt for an exported JSON file."""
 
-    __tablename__ = "import_batches"
+    __tablename__ = "import_batches"  # type: ignore
     __table_args__ = (
         UniqueConstraint("source_path", "source_sha256", name="uq_import_source_revision"),
     )
@@ -37,7 +37,7 @@ class ImportBatch(SQLModel, table=True):
 class Chat(SQLModel, table=True):
     """A QQ group, direct conversation, or other peer represented by an export."""
 
-    __tablename__ = "chats"
+    __tablename__ = "chats"  # type: ignore
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     peer_uid: str = Field(unique=True, index=True)
@@ -58,7 +58,7 @@ class Chat(SQLModel, table=True):
 class Participant(SQLModel, table=True):
     """A distinct QQ account observed as a message sender or mentioned user."""
 
-    __tablename__ = "participants"
+    __tablename__ = "participants"  # type: ignore
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     uid: str = Field(unique=True, index=True)
@@ -75,7 +75,7 @@ class Participant(SQLModel, table=True):
 class BinaryResource(SQLModel, table=True):
     """Deduplicated bytes for an image, audio file, video, or other attachment."""
 
-    __tablename__ = "binary_resources"
+    __tablename__ = "binary_resources"  # type: ignore
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     sha256: str = Field(unique=True, index=True, max_length=64)
@@ -92,7 +92,7 @@ class BinaryResource(SQLModel, table=True):
 class ChatMembership(SQLModel, table=True):
     """The chat-specific identity of a participant, including group card."""
 
-    __tablename__ = "chat_memberships"
+    __tablename__ = "chat_memberships"  # type: ignore
     __table_args__ = (UniqueConstraint("chat_id", "participant_id", name="uq_chat_membership"),)
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
@@ -109,7 +109,7 @@ class ChatMembership(SQLModel, table=True):
 class Message(SQLModel, table=True):
     """A normalized chat message while retaining the original rendered content."""
 
-    __tablename__ = "messages"
+    __tablename__ = "messages"  # type: ignore
     __table_args__ = (UniqueConstraint("chat_id", "external_id", name="uq_chat_message"),)
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
@@ -125,7 +125,9 @@ class Message(SQLModel, table=True):
     sequence: str | None = None
     message_type: str = Field(index=True)
     sent_at: datetime = Field(index=True)
-    source_timestamp_ms: int = Field(index=True)
+    source_timestamp_ms: int = Field(
+        sa_column=Column(BigInteger, nullable=False, index=True)
+    )
     text: str = ""
     html: str = ""
     recalled: bool = False
@@ -143,7 +145,7 @@ class Message(SQLModel, table=True):
 class MessageElement(SQLModel, table=True):
     """One ordered rich-content element in a message."""
 
-    __tablename__ = "message_elements"
+    __tablename__ = "message_elements"  # type: ignore
     __table_args__ = (UniqueConstraint("message_id", "position", name="uq_message_element_position"),)
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
@@ -158,7 +160,7 @@ class MessageElement(SQLModel, table=True):
 class MessageResource(SQLModel, table=True):
     """A resource reference and its optional local file in resources/images."""
 
-    __tablename__ = "message_resources"
+    __tablename__ = "message_resources"  # type: ignore
     __table_args__ = (UniqueConstraint("message_id", "position", name="uq_message_resource_position"),)
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
@@ -183,7 +185,7 @@ class MessageResource(SQLModel, table=True):
 class MessageMention(SQLModel, table=True):
     """A mention embedded in a message, linked when the participant is known."""
 
-    __tablename__ = "message_mentions"
+    __tablename__ = "message_mentions"  # type: ignore
     __table_args__ = (UniqueConstraint("message_id", "position", name="uq_message_mention_position"),)
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
