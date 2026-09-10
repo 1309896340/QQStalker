@@ -92,7 +92,7 @@ def start_stall_monitor(log_file: Path, timeout_seconds: int):
     return stack_log
 
 
-def database_url_from_environment() -> str:
+def database_url_from_environment() -> str | URL:
     """Build a psycopg URL from DATABASE_URL or the Compose environment variables."""
 
     configured_url = os.getenv("DATABASE_URL")
@@ -107,20 +107,22 @@ def database_url_from_environment() -> str:
 
     host = os.getenv("POSTGRES_HOST", "localhost")
     port = os.getenv("POSTGRES_PORT", "5432")
-    return str(
-        URL.create(
-            "postgresql+psycopg",
-            username=user,
-            password=password,
-            host=host,
-            port=int(port),
-            database=database,
-        )
+    return URL.create(
+        "postgresql+psycopg",
+        username=user,
+        password=password,
+        host=host,
+        port=int(port),
+        database=database,
     )
 
 
 def create_database_engine() -> Engine:
-    return create_engine(database_url_from_environment(), pool_pre_ping=True)
+    return create_engine(
+        database_url_from_environment(),
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": 10},
+    )
 
 
 def resolve_resource_path(
