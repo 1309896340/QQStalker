@@ -1,0 +1,1 @@
+"""QQStalker application package."""
