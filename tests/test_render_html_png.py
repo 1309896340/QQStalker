@@ -51,6 +51,32 @@ class ArgumentParserTests(unittest.TestCase):
 
         self.assertEqual(args.max_height_px, 8000)
 
+    def test_horizontal_stitch_defaults_to_four_segments(self) -> None:
+        """Horizontal stitching is opt-in and groups four segments by default."""
+
+        args = render_html_png.build_argument_parser().parse_args(
+            ["input.html", "output", "--stitch-horizontal"]
+        )
+
+        self.assertTrue(args.stitch_horizontal)
+        self.assertEqual(args.stitch_count, 4)
+
+    def test_horizontal_stitch_accepts_a_custom_segment_count(self) -> None:
+        """The stitch count controls how many segments form each output image."""
+
+        args = render_html_png.build_argument_parser().parse_args(
+            [
+                "input.html",
+                "output",
+                "--stitch-horizontal",
+                "--stitch-count",
+                "2",
+            ]
+        )
+
+        self.assertTrue(args.stitch_horizontal)
+        self.assertEqual(args.stitch_count, 2)
+
     def test_creates_directory_and_uses_timestamped_filename(self) -> None:
         """The second positional argument is an output directory."""
 
@@ -76,6 +102,16 @@ class ArgumentParserTests(unittest.TestCase):
                 Path("output") / "20260911083045_群员画像_2.png",
                 Path("output") / "20260911083045_群员画像_3.png",
             ],
+        )
+
+    def test_stitching_uses_one_output_path_per_group(self) -> None:
+        """Four vertical segments need one final output when the group size is four."""
+
+        output_path = Path("output") / "20260911083045_群员画像.png"
+
+        self.assertEqual(
+            render_html_png.output_paths(output_path, 1),
+            [Path("output") / "20260911083045_群员画像.png"],
         )
 
 

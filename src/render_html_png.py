@@ -6,12 +6,14 @@ import argparse
 import math
 import os
 import struct
+import tempfile
 import zlib
 from datetime import datetime
+from html import escape
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Browser, Page, sync_playwright
 
 CSS_PIXELS_PER_INCH = 96.0
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -71,6 +73,46 @@ def output_paths(output_path: Path, segment_count: int) -> list[Path]:
         output_path.with_name(f"{output_path.stem}_{index}{output_path.suffix}")
         for index in range(1, segment_count + 1)
     ]
+
+
+def stitch_pngs_horizontally(
+    browser: Browser,
+    source_paths: list[Path],
+    output_paths_to_write: list[Path],
+    *,
+    images_per_output: int,
+    dpi: int,
+) -> None:
+    """Stitch consecutive PNG segments horizontally without resampling them."""
+
+    stitch_page = browser.new_page(viewport={"width": 1, "height": 1})
+    try:
+        for output_index, output_path in enumerate(output_paths_to_write):
+            start = output_index * images_per_output
+            segment_paths = source_paths[start : start + images_per_output]
+            images = "".join(
+                f'<img src="{escape(path.resolve().as_uri(), quote=True)}">'
+                for path in segment_paths
+            )
+            stitch_page.set_content(
+                "<!doctype html><style>"
+                "html, body { margin: 0; padding: 0; background: white; }"
+                ".segments { display: flex; align-items: flex-start; width: max-content; }"
+                ".segments img { display: block; flex: none; }"
+                f"</style><body><div class=\"segments\">{images}</div>"
+            )
+            wait_for_document_resources(stitch_page)
+            images_loaded = stitch_page.locator(".segments img").evaluate_all(
+                "images => images.every(image => image.naturalWidth > 0 && image.naturalHeight > 0)"
+            )
+            if not images_loaded:
+                raise RuntimeError("无法加载待横向拼接的 PNG 分片")
+            width, height = document_dimensions(stitch_page)
+            stitch_page.set_viewport_size({"width": width, "height": height})
+            stitch_page.screenshot(path=str(output_path), scale="device")
+            set_png_dpi(output_path, dpi)
+    finally:
+        stitch_page.close()
 
 
 def make_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
@@ -160,6 +202,8 @@ def render_html_to_pngs(
     dpi: int,
     width_millimeters: float,
     max_height_pixels: int,
+    stitch_horizontal: bool = False,
+    stitch_count: int = 4,
 ) -> list[Path]:
     """Render fixed-width HTML in vertical PNG segments at the requested DPI."""
 
@@ -193,28 +237,66 @@ def render_html_to_pngs(
                 )
 
             segment_count = math.ceil(document_height / max_segment_css_height)
-            paths = output_paths(output_path, segment_count)
+            final_paths = output_paths(
+                output_path,
+                math.ceil(segment_count / stitch_count)
+                if stitch_horizontal
+                else segment_count,
+            )
+            temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+            if stitch_horizontal:
+                temporary_directory = tempfile.TemporaryDirectory(
+                    prefix=".render_html_png_",
+                    dir=output_path.parent,
+                )
+                paths = [
+                    Path(temporary_directory.name) / f"segment_{index}.png"
+                    for index in range(1, segment_count + 1)
+                ]
+            else:
+                paths = final_paths
             print(
                 f"正在渲染 {document_height} CSS px 高的 HTML："
                 f"{segment_count} 张图片，{dpi} DPI。",
                 flush=True,
             )
-            for index, (segment_top, path) in enumerate(
-                zip(range(0, document_height, max_segment_css_height), paths, strict=True),
-                1,
-            ):
-                segment_height = min(max_segment_css_height, document_height - segment_top)
-                page.set_viewport_size({"width": css_width, "height": segment_height})
-                page.evaluate("segmentTop => window.scrollTo(0, segmentTop)", segment_top)
-                page.screenshot(
-                    path=str(path),
-                    scale="device",
-                )
-                set_png_dpi(path, dpi)
-                print(f"已写入图片 {index}/{segment_count}：{path.resolve()}", flush=True)
+            try:
+                for index, (segment_top, path) in enumerate(
+                    zip(range(0, document_height, max_segment_css_height), paths, strict=True),
+                    1,
+                ):
+                    segment_height = min(max_segment_css_height, document_height - segment_top)
+                    page.set_viewport_size({"width": css_width, "height": segment_height})
+                    page.evaluate("segmentTop => window.scrollTo(0, segmentTop)", segment_top)
+                    page.screenshot(
+                        path=str(path),
+                        scale="device",
+                    )
+                    set_png_dpi(path, dpi)
+                    if stitch_horizontal:
+                        print(f"已生成临时分片 {index}/{segment_count}", flush=True)
+                    else:
+                        print(f"已写入图片 {index}/{segment_count}：{path.resolve()}", flush=True)
+
+                if stitch_horizontal:
+                    stitch_pngs_horizontally(
+                        browser,
+                        paths,
+                        final_paths,
+                        images_per_output=stitch_count,
+                        dpi=dpi,
+                    )
+                    for index, path in enumerate(final_paths, 1):
+                        print(
+                            f"已横向拼接图片 {index}/{len(final_paths)}：{path.resolve()}",
+                            flush=True,
+                        )
+            finally:
+                if temporary_directory is not None:
+                    temporary_directory.cleanup()
         finally:
             browser.close()
-    return paths
+    return final_paths
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -242,6 +324,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
             f"（默认：环境变量 {PNG_MAX_HEIGHT_PIXELS_ENV} 或 {DEFAULT_MAX_HEIGHT_PIXELS}）"
         ),
     )
+    parser.add_argument(
+        "--stitch-horizontal",
+        action="store_true",
+        help="将连续的垂直分片横向拼接为最终 PNG",
+    )
+    parser.add_argument(
+        "--stitch-count",
+        type=positive_integer,
+        default=4,
+        help="每张拼接图片包含的分片数量（仅 --stitch-horizontal 生效，默认：4）",
+    )
     return parser
 
 
@@ -255,6 +348,8 @@ def main() -> None:
             dpi=args.dpi,
             width_millimeters=args.width_mm,
             max_height_pixels=args.max_height_px,
+            stitch_horizontal=args.stitch_horizontal,
+            stitch_count=args.stitch_count,
         )
     except (FileNotFoundError, RuntimeError, ValueError) as error:
         raise SystemExit(str(error)) from error

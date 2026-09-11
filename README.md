@@ -49,6 +49,13 @@ uv run python -m src.analyze_transcript .\exports\2026-09-01.md .\analysis
 uv run python -m src.render_html_png .\analysis\portrait.html .\analysis
 ```
 
+若要将连续分片横向拼接，可加上 `--stitch-horizontal`；每张拼接图片默认包含 4 个分片，
+可用 `--stitch-count` 调整：
+
+```powershell
+uv run python -m src.render_html_png .\analysis\portrait.html .\analysis --stitch-horizontal --stitch-count 2
+```
+
 ## 工具说明
 
 | 脚本 | 用途 |
