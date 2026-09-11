@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import html
 import json
 import os
 import re
@@ -23,19 +22,17 @@ PROMPT = """分析聊天记录中出现的每个群员的画像。
 
 ### 成员姓名
 - **活跃度**：仅写“X 条（Y%），时段概括”。X 使用成员清单中的消息数量，Y 使用给出的占比；不要添加其他描述。
-- **互动与表达**：概括可直接观察到的互动方式、表达语气和观点呈现方式；不评价发言频率、连续性或单句长短。
 - **关注话题**：概括反复出现的话题。
-- **精选语录**：提炼 1–2 条最具代表性的具体观点；每条不超过 25 字，用“；”分隔。没有明确观点时不显示。
+“最具代表性的具体观点或语录，不超过 25 字”
 - **角色定位**：10个字以内概括该群员在群里的角色定位。
 - **群员画像**：用一句精炼的话总结。
 
 约束：
 1. 每个字段用一句简短概括，不要逐条复述聊天内容。
-2. 不引用原话、不列举证据、不添加引号内的聊天片段；“精选语录”应是忠实的简短转述。
+2. 不引用原话、不列举证据、不添加引号内的聊天片段；独立引语行应是忠实的简短转述。没有明确观点时不显示该行。
 3. 不把昵称、性别、年龄、职业、住址、健康或现实关系等敏感信息当作事实；没有直接证据时写“推测”。
 4. 不杜撰聊天记录中不存在的经历、观点或关系；避免侮辱性、诊断式或绝对化标签。
 5. 输出只包含成员画像，不要说明推理过程、任务说明或结语。
-6. “互动与表达”不得使用“高频”“刷屏”“短句连发”等对消息频率、连续性或长度的评价。
 """
 DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_MAX_TOKENS = 4_096
@@ -227,6 +224,7 @@ def build_featured_quotes_prompt(transcript: str, *, quote_count: int) -> str:
 2. 不选择包含个人敏感信息、歧视性攻击、威胁、色情内容或需要大量上下文才能理解的发言。
 3. 每条点评不超过 40 字，具体说明其幽默、讽刺、荒诞或观点冲击力所在，不进行人身评价。
 4. 只输出以下 Markdown 条目；不要添加总标题、前言、结语或编号之外的内容：
+5. QQ 表情可能以 Unicode 表情或 `[表情名]` 形式出现。若表情参与语义或语气，保留 Unicode 表情；将文本占位写成“（QQ表情：表情名）”，不要只摘取表情，也不要将其删除或替换为损坏的图片链接。
 
 ### 成员名称
 > 语录原文
@@ -630,7 +628,7 @@ def build_analysis_document(
     return "\n".join(sections)
 
 
-def render_html(analysis: str, *, source_path: Path, model: str) -> str:
+def render_html(analysis: str) -> str:
     """Wrap untrusted model text in a safe, readable standalone HTML document."""
 
     rendered_markdown = markdown.markdown(
@@ -645,9 +643,7 @@ def render_html(analysis: str, *, source_path: Path, model: str) -> str:
         protocols=("http", "https", "mailto"),
         strip=True,
     )
-    escaped_source = html.escape(str(source_path.resolve()))
-    escaped_model = html.escape(model)
-    generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -699,9 +695,7 @@ def render_html(analysis: str, *, source_path: Path, model: str) -> str:
       <div class="analysis">{analysis_html}</div>
     </article>
     <footer>
-      <div>生成时间：{html.escape(generated_at)}</div>
-      <div>模型：<code>{escaped_model}</code></div>
-      <div>消息记录：<code>{escaped_source}</code></div>
+      <div>生成时间：{generated_at}</div>
     </footer>
   </main>
 </body>
@@ -784,7 +778,7 @@ def main() -> None:
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
-            render_html(analysis, source_path=args.input_markdown, model=model),
+            render_html(analysis),
             encoding="utf-8",
         )
     except (FileNotFoundError, RuntimeError, ValueError) as error:

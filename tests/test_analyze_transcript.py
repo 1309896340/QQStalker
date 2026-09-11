@@ -95,14 +95,16 @@ class AnalysisDocumentTests(unittest.TestCase):
 
 
 class PromptTests(unittest.TestCase):
-    def test_requires_one_or_two_featured_viewpoints_for_each_member(self) -> None:
-        """Portrait prompts must request concise, evidence-grounded viewpoint selections."""
+    def test_requires_an_unlabeled_quoted_viewpoint_for_each_member(self) -> None:
+        """Portrait prompts must use a standalone quote instead of a labeled field."""
 
         prompt = analyze_transcript.build_member_prompt((("甲", ["一条消息"]),))
 
-        self.assertIn("**精选语录**", prompt)
-        self.assertIn("1–2 条", prompt)
+        self.assertNotIn("**精选语录**", prompt)
+        self.assertIn("“最具代表性的具体观点或语录", prompt)
+        self.assertIn("不超过 25 字", prompt)
         self.assertIn("忠实的简短转述", prompt)
+        self.assertNotIn("互动与表达", prompt)
 
     def test_requests_high_quality_group_quotes(self) -> None:
         """The quote prompt must follow the requested humorous and provocative criteria."""
@@ -115,6 +117,20 @@ class PromptTests(unittest.TestCase):
         self.assertIn("幽默、讽刺或“逆天”程度", prompt)
         self.assertIn("精选 8 条", prompt)
         self.assertIn("成员名称", prompt)
+        self.assertIn("QQ 表情", prompt)
+        self.assertIn("（QQ表情：表情名）", prompt)
+
+
+class HtmlRenderingTests(unittest.TestCase):
+    def test_footer_only_shows_timezone_free_generation_time(self) -> None:
+        """Generated HTML must not expose its source path or model configuration."""
+
+        rendered = analyze_transcript.render_html("# 群员画像分析")
+
+        self.assertIn("生成时间：", rendered)
+        self.assertNotIn("消息记录：", rendered)
+        self.assertNotIn("模型：<code>", rendered)
+        self.assertNotIn("中国标准时间", rendered)
 
 
 class PortraitNormalizationTests(unittest.TestCase):

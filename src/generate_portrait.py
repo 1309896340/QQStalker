@@ -96,11 +96,7 @@ def generate_portrait(
         html_path = analyze_transcript.resolve_output_path(output_dir)
         html_path.parent.mkdir(parents=True, exist_ok=True)
         html_path.write_text(
-            analyze_transcript.render_html(
-                analysis,
-                source_path=markdown_path,
-                model=model,
-            ),
+            analyze_transcript.render_html(analysis),
             encoding="utf-8",
         )
         output_path = render_html_png.create_output_path(output_dir)
