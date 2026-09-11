@@ -104,14 +104,37 @@ class ArgumentParserTests(unittest.TestCase):
             ],
         )
 
-    def test_stitching_uses_one_output_path_per_group(self) -> None:
-        """Four vertical segments need one final output when the group size is four."""
+    def test_stitching_leaves_a_single_segment_as_the_base_filename(self) -> None:
+        """A single segment does not need a temporary horizontal stitch step."""
 
         output_path = Path("output") / "20260911083045_群员画像.png"
 
         self.assertEqual(
-            render_html_png.output_paths(output_path, 1),
+            render_html_png.final_output_paths(
+                output_path,
+                1,
+                stitch_horizontal=True,
+                stitch_count=4,
+            ),
             [Path("output") / "20260911083045_群员画像.png"],
+        )
+
+    def test_stitching_numbers_each_final_group(self) -> None:
+        """Five segments form two outputs when four are stitched horizontally."""
+
+        output_path = Path("output") / "20260911083045_群员画像.png"
+
+        self.assertEqual(
+            render_html_png.final_output_paths(
+                output_path,
+                5,
+                stitch_horizontal=True,
+                stitch_count=4,
+            ),
+            [
+                Path("output") / "20260911083045_群员画像_1.png",
+                Path("output") / "20260911083045_群员画像_2.png",
+            ],
         )
 
 

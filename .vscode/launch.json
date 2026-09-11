@@ -60,6 +60,39 @@
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true
+    },
+    {
+      "name": "一键生成群员画像 PNG",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "src.generate_portrait",
+      "args": [
+        "2026-09-11",
+        "${workspaceFolder}/analysis",
+        // "--end-date",
+        // "2026-09-11",
+        // "--timezone",
+        // "Asia/Shanghai",
+        // "--env-file",
+        // "${workspaceFolder}/.env",
+        // "--top-members",
+        // "20",
+        // "--min-message-count",
+        // "0",
+        // "--dpi",
+        // "300",
+        // "--width-mm",
+        // "210",
+        // "--max-height-px",
+        // "30000",
+        // "--stitch-horizontal",
+        // "--stitch-count",
+        // "4"
+      ],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
     }
   ]
 }

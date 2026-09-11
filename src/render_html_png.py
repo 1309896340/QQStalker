@@ -75,6 +75,20 @@ def output_paths(output_path: Path, segment_count: int) -> list[Path]:
     ]
 
 
+def final_output_paths(
+    output_path: Path,
+    segment_count: int,
+    *,
+    stitch_horizontal: bool,
+    stitch_count: int,
+) -> list[Path]:
+    """Return final paths, preserving a single unstitched segment as-is."""
+
+    if stitch_horizontal and segment_count > 1:
+        return output_paths(output_path, math.ceil(segment_count / stitch_count))
+    return output_paths(output_path, segment_count)
+
+
 def stitch_pngs_horizontally(
     browser: Browser,
     source_paths: list[Path],
@@ -90,17 +104,20 @@ def stitch_pngs_horizontally(
         for output_index, output_path in enumerate(output_paths_to_write):
             start = output_index * images_per_output
             segment_paths = source_paths[start : start + images_per_output]
+            stitch_html_path = segment_paths[0].parent / f".stitch_{output_index}.html"
             images = "".join(
                 f'<img src="{escape(path.resolve().as_uri(), quote=True)}">'
                 for path in segment_paths
             )
-            stitch_page.set_content(
+            stitch_html_path.write_text(
                 "<!doctype html><style>"
                 "html, body { margin: 0; padding: 0; background: white; }"
                 ".segments { display: flex; align-items: flex-start; width: max-content; }"
                 ".segments img { display: block; flex: none; }"
-                f"</style><body><div class=\"segments\">{images}</div>"
+                f"</style><body><div class=\"segments\">{images}</div>",
+                encoding="utf-8",
             )
+            stitch_page.goto(stitch_html_path.resolve().as_uri(), wait_until="load")
             wait_for_document_resources(stitch_page)
             images_loaded = stitch_page.locator(".segments img").evaluate_all(
                 "images => images.every(image => image.naturalWidth > 0 && image.naturalHeight > 0)"
@@ -237,14 +254,15 @@ def render_html_to_pngs(
                 )
 
             segment_count = math.ceil(document_height / max_segment_css_height)
-            final_paths = output_paths(
+            should_stitch = stitch_horizontal and segment_count > 1
+            final_paths = final_output_paths(
                 output_path,
-                math.ceil(segment_count / stitch_count)
-                if stitch_horizontal
-                else segment_count,
+                segment_count,
+                stitch_horizontal=stitch_horizontal,
+                stitch_count=stitch_count,
             )
             temporary_directory: tempfile.TemporaryDirectory[str] | None = None
-            if stitch_horizontal:
+            if should_stitch:
                 temporary_directory = tempfile.TemporaryDirectory(
                     prefix=".render_html_png_",
                     dir=output_path.parent,
@@ -273,12 +291,12 @@ def render_html_to_pngs(
                         scale="device",
                     )
                     set_png_dpi(path, dpi)
-                    if stitch_horizontal:
+                    if should_stitch:
                         print(f"已生成临时分片 {index}/{segment_count}", flush=True)
                     else:
                         print(f"已写入图片 {index}/{segment_count}：{path.resolve()}", flush=True)
 
-                if stitch_horizontal:
+                if should_stitch:
                     stitch_pngs_horizontally(
                         browser,
                         paths,
