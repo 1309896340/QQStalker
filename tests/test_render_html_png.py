@@ -1,6 +1,9 @@
 """Tests for PNG rendering command-line configuration."""
 
 import os
+from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -13,7 +16,7 @@ class ArgumentParserTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"PNG_DPI": "144"}, clear=False):
             args = render_html_png.build_argument_parser().parse_args(
-                ["input.html", "output.png"]
+                ["input.html", "output"]
             )
 
         self.assertEqual(args.dpi, 144)
@@ -23,7 +26,7 @@ class ArgumentParserTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"PNG_DPI": "144"}, clear=False):
             args = render_html_png.build_argument_parser().parse_args(
-                ["input.html", "output.png", "--dpi", "200"]
+                ["input.html", "output", "--dpi", "200"]
             )
 
         self.assertEqual(args.dpi, 200)
@@ -33,7 +36,7 @@ class ArgumentParserTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"PNG_MAX_HEIGHT_PIXELS": "12000"}, clear=False):
             args = render_html_png.build_argument_parser().parse_args(
-                ["input.html", "output.png"]
+                ["input.html", "output"]
             )
 
         self.assertEqual(args.max_height_px, 12000)
@@ -43,10 +46,37 @@ class ArgumentParserTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"PNG_MAX_HEIGHT_PIXELS": "12000"}, clear=False):
             args = render_html_png.build_argument_parser().parse_args(
-                ["input.html", "output.png", "--max-height-px", "8000"]
+                ["input.html", "output", "--max-height-px", "8000"]
             )
 
         self.assertEqual(args.max_height_px, 8000)
+
+    def test_creates_directory_and_uses_timestamped_filename(self) -> None:
+        """The second positional argument is an output directory."""
+
+        with TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory) / "portraits"
+            output_path = render_html_png.create_output_path(
+                output_dir,
+                generated_at=datetime(2026, 9, 11, 8, 30, 45),
+            )
+
+            self.assertTrue(output_dir.is_dir())
+            self.assertEqual(output_path.name, "20260911083045_群员画像.png")
+
+    def test_numbers_split_output_paths(self) -> None:
+        """Split renders append one-based sequence suffixes to the base filename."""
+
+        output_path = Path("output") / "20260911083045_群员画像.png"
+
+        self.assertEqual(
+            render_html_png.output_paths(output_path, 3),
+            [
+                Path("output") / "20260911083045_群员画像_1.png",
+                Path("output") / "20260911083045_群员画像_2.png",
+                Path("output") / "20260911083045_群员画像_3.png",
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import math
 import os
 import struct
 import zlib
+from datetime import datetime
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
@@ -51,16 +52,14 @@ def css_pixels_for_millimeters(width_millimeters: float) -> int:
     return max(1, round(width_millimeters / 25.4 * CSS_PIXELS_PER_INCH))
 
 
-def normalize_output_path(output_path: Path) -> Path:
-    """Ensure the output path names a PNG file."""
+def create_output_path(output_dir: Path, *, generated_at: datetime | None = None) -> Path:
+    """Create the output directory and return its timestamped PNG path."""
 
-    if output_path.exists() and output_path.is_dir():
-        raise ValueError("输出路径必须是 PNG 文件，而不是目录")
-    if not output_path.suffix:
-        return output_path.with_suffix(".png")
-    if output_path.suffix.lower() != ".png":
-        raise ValueError("输出文件必须使用 .png 扩展名")
-    return output_path
+    if output_dir.exists() and not output_dir.is_dir():
+        raise ValueError("输出路径必须是文件夹")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = (generated_at or datetime.now()).strftime("%Y%m%d%H%M%S")
+    return output_dir / f"{timestamp}_群员画像.png"
 
 
 def output_paths(output_path: Path, segment_count: int) -> list[Path]:
@@ -221,7 +220,7 @@ def render_html_to_pngs(
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input_html", type=Path, help="待渲染的 HTML 文件")
-    parser.add_argument("output_png", type=Path, help="输出 PNG 文件路径")
+    parser.add_argument("output_dir", type=Path, help="PNG 输出文件夹；不存在时自动创建")
     parser.add_argument(
         "--dpi",
         type=positive_integer,
@@ -249,7 +248,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argument_parser().parse_args()
     try:
-        output_path = normalize_output_path(args.output_png)
+        output_path = create_output_path(args.output_dir)
         paths = render_html_to_pngs(
             args.input_html,
             output_path,
