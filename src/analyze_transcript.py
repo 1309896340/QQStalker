@@ -17,25 +17,23 @@ import markdown
 
 PROMPT = """分析聊天记录中出现的每个群员的画像。
 
-任务目标：仅基于本批次给出的聊天记录，为成员清单中的每一位成员分别写出画像；不能遗漏、合并或新增名单外的人。即使某成员只有一条消息，也必须保留其独立条目，并明确标注“证据不足”。
+任务目标：仅基于本批次给出的聊天记录，为成员清单中的每一位成员分别写出简洁画像；不能遗漏、合并或新增名单外的人。信息不足时明确写“证据不足”。
 
 对每位成员严格使用以下 Markdown 结构（成员姓名必须与清单完全一致）：
 
 ### 成员姓名
-- **活跃度与参与方式**：发言频率、时段、消息长度、主动发起或跟随讨论的倾向。
-- **性格与互动风格**：从可观察行为提炼的性格特点、情绪表达、边界感与互动模式。
-- **语言风格**：常用词、语气、句式、玩梗/表情/引用习惯、论证或吐槽方式。
-- **兴趣话题与观点**：反复出现的影视、游戏、生活、社会或其他话题，以及表达立场的方式。
-- **群内角色定位**：例如话题发起者、知识补充者、气氛组、评论者、旁观者、协调者等；说明依据。
-- **关系与影响**：只描述记录中直接可见的互动对象、协作、调侃或分歧，不猜测现实关系。
-- **一句话画像**：简洁、可读、不过度标签化的总结。
-- **证据与置信度**：列出 1—3 条简短的可验证线索；区分“明确事实”和“合理推测”。
+- **活跃度**：仅写“X 条（Y%），时段概括”。X 使用成员清单中的消息数量，Y 使用给出的占比；不要添加其他描述。
+- **互动与表达**：概括互动风格与语言特点。
+- **关注话题**：概括反复出现的话题、提出的观点。
+- **角色定位**：10个字以内概括该群员在群里的角色定位。
+- **群员画像**：用一句精炼的话总结。
 
 约束：
-1. 覆盖清单中的每一位成员，按清单顺序输出，不要只写活跃成员。
-2. 不把昵称、性别、年龄、职业、住址、健康或现实关系等敏感信息当作事实；没有直接证据时写“无法判断”或“推测”。
-3. 不杜撰聊天记录中不存在的经历、观点或关系；避免侮辱性、诊断式或绝对化标签。
-4. 输出只包含成员画像，不要说明你的推理过程、任务说明或结语。
+1. 每个字段用一句简短概括，不要逐条复述聊天内容。
+2. 不引用原话、不列举证据、不添加引号内的聊天片段。
+3. 不把昵称、性别、年龄、职业、住址、健康或现实关系等敏感信息当作事实；没有直接证据时写“推测”。
+4. 不杜撰聊天记录中不存在的经历、观点或关系；避免侮辱性、诊断式或绝对化标签。
+5. 输出只包含成员画像，不要说明推理过程、任务说明或结语。
 """
 DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_MAX_TOKENS = 4_096
@@ -43,6 +41,19 @@ DEFAULT_MEMBERS_PER_REQUEST = 6
 DEFAULT_MAX_INPUT_CHARACTERS = 24_000
 MESSAGE_BLOCK_PATTERN = re.compile(
     r"(?ms)^## [^\n]+\n\n> \*\*(?P<member>.+?)\*\*\n>\n.*?(?=^## |\Z)"
+)
+MESSAGE_TIMESTAMP_PATTERN = re.compile(
+    r"(?m)^## (?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
+)
+GENERIC_PORTRAIT_HEADING_PATTERN = re.compile(r"(?m)^#{1,6}\s+成员画像\s*$\n?")
+ACTIVITY_LINE_PATTERN = re.compile(r"(?m)^-\s+\*\*活跃度\*\*：.*(?:\n|$)")
+TIME_PERIODS = (
+    (range(0, 6), "凌晨"),
+    (range(6, 9), "早晨"),
+    (range(9, 12), "上午"),
+    (range(12, 14), "中午"),
+    (range(14, 18), "下午"),
+    (range(18, 24), "晚间"),
 )
 ALLOWED_MARKDOWN_TAGS = frozenset(
     {
@@ -122,6 +133,30 @@ def positive_integer_setting(name: str, default: int) -> int:
     return parsed
 
 
+def positive_integer(value: str) -> int:
+    """Parse a positive CLI integer."""
+
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("必须是正整数") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    return parsed
+
+
+def nonnegative_integer(value: str) -> int:
+    """Parse a non-negative CLI integer."""
+
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("必须是非负整数") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("必须是非负整数")
+    return parsed
+
+
 def extract_member_messages(transcript: str) -> list[tuple[str, list[str]]]:
     """Group every exported transcript message by its displayed group card."""
 
@@ -133,6 +168,26 @@ def extract_member_messages(transcript: str) -> list[tuple[str, list[str]]]:
     if not members:
         raise RuntimeError("未能从消息记录中识别成员；请使用 export_markdown.py 生成的文件")
     return list(members.items())
+
+
+def select_members(
+    members: list[tuple[str, list[str]]],
+    *,
+    top_members: int | None,
+    min_message_count: int,
+) -> list[tuple[str, list[str]]]:
+    """Filter members by message count and optionally select the most active ones."""
+
+    selected = [
+        (member, messages)
+        for member, messages in members
+        if len(messages) >= min_message_count
+    ]
+    if top_members is None:
+        return selected
+    return sorted(selected, key=lambda member_and_messages: -len(member_and_messages[1]))[
+        :top_members
+    ]
 
 
 def build_member_prompt(member_batch: tuple[tuple[str, list[str]], ...]) -> str:
@@ -161,6 +216,64 @@ def has_member_heading(analysis: str, member: str) -> bool:
     """Check that the response contains the exact required heading for a member."""
 
     return re.search(rf"(?m)^###\s+{re.escape(member)}(?:\s|$)", analysis) is not None
+
+
+def normalize_member_portraits(
+    analysis: str,
+    member_batch: tuple[tuple[str, list[str]], ...],
+    *,
+    total_message_count: int,
+) -> str:
+    """Remove model-added section titles and make activity summaries exact."""
+
+    normalized = GENERIC_PORTRAIT_HEADING_PATTERN.sub("", analysis)
+    for member, messages in member_batch:
+        section_pattern = re.compile(
+            rf"(?ms)(?P<heading>^###\s+{re.escape(member)}(?=\s|$)[^\n]*$)"
+            rf"(?P<body>.*?)(?=^###\s|\Z)"
+        )
+        activity_line = f"- **活跃度**：{build_activity_summary(messages, total_message_count=total_message_count)}\n"
+
+        def replace_section(match: re.Match[str]) -> str:
+            body = match.group("body")
+            if ACTIVITY_LINE_PATTERN.search(body):
+                body = ACTIVITY_LINE_PATTERN.sub(activity_line, body, count=1)
+            else:
+                body = f"\n{activity_line}{body.lstrip()}"
+            return f"{match.group('heading')}{body}"
+
+        normalized = section_pattern.sub(replace_section, normalized)
+    return normalized.strip()
+
+
+def build_activity_summary(messages: list[str], *, total_message_count: int) -> str:
+    """Format an exact count, transcript share, and concise peak activity period."""
+
+    message_count = len(messages)
+    percentage = message_count / total_message_count * 100
+    formatted_percentage = f"{percentage:.1f}".rstrip("0").rstrip(".")
+    period_counts = {label: 0 for _, label in TIME_PERIODS}
+    for message in messages:
+        match = MESSAGE_TIMESTAMP_PATTERN.search(message)
+        if not match:
+            continue
+        timestamp = datetime.strptime(match.group("timestamp"), "%Y-%m-%d %H:%M:%S")
+        for hours, label in TIME_PERIODS:
+            if timestamp.hour in hours:
+                period_counts[label] += 1
+                break
+
+    peak_count = max(period_counts.values())
+    if peak_count == 0:
+        period_summary = "时段未知"
+    else:
+        peak_periods = [
+            label
+            for _, label in TIME_PERIODS
+            if period_counts[label] == peak_count
+        ][:2]
+        period_summary = f"{'、'.join(peak_periods)}为主"
+    return f"{message_count} 条（{formatted_percentage}%），{period_summary}。"
 
 
 def batch_members(
@@ -375,22 +488,26 @@ def analyze_all_members(
     timeout_seconds: float,
     members_per_request: int,
     max_input_characters: int,
+    top_members: int | None,
+    min_message_count: int,
 ) -> str:
     """Produce a complete portrait section for every member in the transcript."""
 
-    members = extract_member_messages(transcript)
-    sections = [
-        "# 群员画像分析",
-        "",
-        f"> 已识别 {len(members)} 位在消息记录中出现的群员，按成员分批分析并逐批校验。",
-        "",
-        "---",
-    ]
+    all_members = extract_member_messages(transcript)
+    members = select_members(
+        all_members,
+        top_members=top_members,
+        min_message_count=min_message_count,
+    )
+    if not members:
+        raise RuntimeError("没有符合成员筛选条件的群员")
     member_batches = batch_members(
         members,
         max_members=members_per_request,
         max_input_characters=max_input_characters,
     )
+    total_message_count = sum(len(messages) for _, messages in all_members)
+    portraits: list[str] = []
     for index, member_batch in enumerate(member_batches, 1):
         message_count = sum(len(messages) for _, messages in member_batch)
         print(
@@ -406,8 +523,30 @@ def analyze_all_members(
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
         )
-        sections.extend(("", f"## 群员批次 {index}", "", batch_analysis))
-    return "\n".join(sections)
+        portraits.append(
+            normalize_member_portraits(
+                batch_analysis,
+                member_batch,
+                total_message_count=total_message_count,
+            )
+        )
+    return build_analysis_document(member_count=len(members), portraits=tuple(portraits))
+
+
+def build_analysis_document(*, member_count: int, portraits: tuple[str, ...]) -> str:
+    """Assemble portrait Markdown without exposing internal request batches."""
+
+    return "\n".join(
+        (
+            "# 群员画像分析",
+            "",
+            f"> 共分析 {member_count} 位群员。",
+            "",
+            "---",
+            "",
+            "\n\n".join(portraits),
+        )
+    )
 
 
 def render_html(analysis: str, *, source_path: Path, model: str) -> str:
@@ -512,6 +651,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=Path(".env"),
         help="包含 LLM 配置的文件（默认：.env）",
     )
+    parser.add_argument(
+        "--top-members",
+        type=positive_integer,
+        help="仅分析发言数量最多的前 N 位群员",
+    )
+    parser.add_argument(
+        "--min-message-count",
+        type=nonnegative_integer,
+        default=0,
+        help="忽略发言数量少于 N 条的群员（默认：0）",
+    )
     return parser
 
 
@@ -541,6 +691,8 @@ def main() -> None:
                 "LLM_MAX_INPUT_CHARACTERS",
                 DEFAULT_MAX_INPUT_CHARACTERS,
             ),
+            top_members=args.top_members,
+            min_message_count=args.min_message_count,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
