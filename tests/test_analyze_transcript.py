@@ -90,8 +90,8 @@ class AnalysisDocumentTests(unittest.TestCase):
             featured_quotes="### 甲\n> 这也太逆天了\n\n- **点评**：荒诞反差强烈。",
         )
 
-        self.assertIn("## 群聊高质量语录精选", analysis)
-        self.assertLess(analysis.index("### 甲"), analysis.index("## 群聊高质量语录精选"))
+        self.assertIn("## 语录精选", analysis)
+        self.assertLess(analysis.index("### 甲"), analysis.index("## 语录精选"))
 
 
 class PromptTests(unittest.TestCase):
@@ -101,7 +101,7 @@ class PromptTests(unittest.TestCase):
         prompt = analyze_transcript.build_member_prompt((("甲", ["一条消息"]),))
 
         self.assertNotIn("**精选语录**", prompt)
-        self.assertIn("“最具代表性的具体观点或语录", prompt)
+        self.assertIn("> **“最具代表性的具体观点或语录", prompt)
         self.assertIn("不超过 25 字", prompt)
         self.assertIn("忠实的简短转述", prompt)
         self.assertNotIn("互动与表达", prompt)

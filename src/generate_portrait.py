@@ -154,7 +154,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=analyze_transcript.positive_integer,
         default=analyze_transcript.DEFAULT_FEATURED_QUOTE_COUNT,
         help=(
-            "群聊高质量语录精选的目标条数"
+            "语录精选的目标条数"
             f"（默认：{analyze_transcript.DEFAULT_FEATURED_QUOTE_COUNT}）"
         ),
     )
