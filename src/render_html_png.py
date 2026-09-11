@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import struct
 import zlib
 from pathlib import Path
@@ -16,6 +17,8 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 DEFAULT_DPI = 300
 DEFAULT_WIDTH_MILLIMETERS = 210.0
 DEFAULT_MAX_HEIGHT_PIXELS = 30_000
+PNG_DPI_ENV = "PNG_DPI"
+PNG_MAX_HEIGHT_PIXELS_ENV = "PNG_MAX_HEIGHT_PIXELS"
 
 
 def positive_integer(value: str) -> int:
@@ -222,8 +225,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dpi",
         type=positive_integer,
-        default=DEFAULT_DPI,
-        help=f"目标 PNG DPI（默认：{DEFAULT_DPI}）",
+        default=os.getenv(PNG_DPI_ENV, str(DEFAULT_DPI)),
+        help=f"目标 PNG DPI（默认：环境变量 {PNG_DPI_ENV} 或 {DEFAULT_DPI}）",
     )
     parser.add_argument(
         "--width-mm",
@@ -234,10 +237,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-height-px",
         type=positive_integer,
-        default=DEFAULT_MAX_HEIGHT_PIXELS,
+        default=os.getenv(PNG_MAX_HEIGHT_PIXELS_ENV, str(DEFAULT_MAX_HEIGHT_PIXELS)),
         help=(
             "单张图片最大物理像素高度；超出时自动输出 _1、_2 等分片"
-            f"（默认：{DEFAULT_MAX_HEIGHT_PIXELS}）"
+            f"（默认：环境变量 {PNG_MAX_HEIGHT_PIXELS_ENV} 或 {DEFAULT_MAX_HEIGHT_PIXELS}）"
         ),
     )
     return parser
