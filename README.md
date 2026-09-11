@@ -56,7 +56,8 @@ uv run python -m src.render_html_png .\analysis\portrait.html .\analysis
 uv run python -m src.render_html_png .\analysis\portrait.html .\analysis --stitch-horizontal --stitch-count 2
 ```
 
-如需从数据库消息记录直接生成最终 PNG，可使用整合命令；Markdown 和 HTML 中间文件会在系统临时目录中自动清理：
+如需从数据库消息记录直接生成最终 PNG，可使用整合命令；Markdown 中间文件会自动清理，
+分析生成的 HTML 则按既有时间戳命名逻辑保留在输出目录（例如 `analysis/`）中：
 
 ```powershell
 uv run python -m src.generate_portrait 2026-09-11 .\analysis
@@ -70,7 +71,7 @@ uv run python -m src.generate_portrait 2026-09-11 .\analysis
 | `src/export_markdown.py` | 从数据库按日期范围生成 Markdown 消息记录。 |
 | `src/analyze_transcript.py` | 调用兼容 OpenAI Chat Completions 的 LLM，为记录中的每位成员生成画像 HTML。 |
 | `src/render_html_png.py` | 通过 Playwright 将 HTML 渲染为高分辨率 PNG。 |
-| `src/generate_portrait.py` | 串联消息导出、LLM 分析与 PNG 渲染，中间文件使用临时目录。 |
+| `src/generate_portrait.py` | 串联消息导出、LLM 分析与 PNG 渲染；消息记录使用临时目录，画像 HTML 保留在输出目录。 |
 | `src/parse_export.py` | 快速检查 JSON 导出文件及资源目录，便于排查导出格式。 |
 
 查看任一工具的完整参数：

@@ -91,7 +91,8 @@ def generate_portrait(
             top_members=top_members,
             min_message_count=min_message_count,
         )
-        html_path = temporary_dir / "群员画像.html"
+        html_path = analyze_transcript.resolve_output_path(output_dir)
+        html_path.parent.mkdir(parents=True, exist_ok=True)
         html_path.write_text(
             analyze_transcript.render_html(
                 analysis,

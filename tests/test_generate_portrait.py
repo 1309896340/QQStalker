@@ -71,8 +71,8 @@ class ArgumentParserTests(unittest.TestCase):
 
 
 class GeneratePortraitTests(unittest.TestCase):
-    def test_uses_temporary_intermediate_files_and_returns_rendered_paths(self) -> None:
-        """Markdown and HTML intermediates exist only for the duration of the pipeline."""
+    def test_caches_html_and_keeps_only_markdown_temporary(self) -> None:
+        """The transcript is temporary while the analysis HTML remains with the PNG output."""
 
         captured: dict[str, object] = {}
 
@@ -116,6 +116,10 @@ class GeneratePortraitTests(unittest.TestCase):
                     return_value="<html></html>",
                 ),
                 patch(
+                    "src.generate_portrait.analyze_transcript.resolve_output_path",
+                    side_effect=lambda output_dir: output_dir / "20260911083045_群员画像.html",
+                ),
+                patch(
                     "src.generate_portrait.render_html_png.render_html_to_pngs",
                     side_effect=render_html_to_pngs,
                 ),
@@ -152,10 +156,10 @@ class GeneratePortraitTests(unittest.TestCase):
                     "stitch_count": 4,
                 },
             )
-
-        markdown_path = captured["markdown_path"]
-        html_path = captured["html_path"]
-        assert isinstance(markdown_path, Path)
-        assert isinstance(html_path, Path)
-        self.assertFalse(markdown_path.exists())
-        self.assertFalse(html_path.exists())
+            markdown_path = captured["markdown_path"]
+            html_path = captured["html_path"]
+            assert isinstance(markdown_path, Path)
+            assert isinstance(html_path, Path)
+            self.assertFalse(markdown_path.exists())
+            self.assertTrue(html_path.is_file())
+            self.assertEqual(html_path.parent, output_dir)
