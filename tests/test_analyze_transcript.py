@@ -118,7 +118,8 @@ class PromptTests(unittest.TestCase):
         self.assertIn("精选 8 条", prompt)
         self.assertIn("成员名称", prompt)
         self.assertIn("QQ 表情", prompt)
-        self.assertIn("（QQ表情：表情名）", prompt)
+        self.assertIn("从展示语录中去除", prompt)
+        self.assertIn("去除后没有文字内容的发言不得入选", prompt)
 
 
 class HtmlRenderingTests(unittest.TestCase):
