@@ -15,9 +15,10 @@ class ArgumentParserTests(unittest.TestCase):
         """The combined CLI keeps the component CLIs' default behavior."""
 
         args = generate_portrait.build_argument_parser().parse_args(
-            ["2026-09-11", "output"]
+            ["2026-09-11", "测试群", "output"]
         )
 
+        self.assertEqual(args.chat_name, "测试群")
         self.assertIsNone(args.end_date)
         self.assertEqual(args.timezone, "Asia/Shanghai")
         self.assertEqual(args.env_file, Path(".env"))
@@ -36,6 +37,7 @@ class ArgumentParserTests(unittest.TestCase):
         args = generate_portrait.build_argument_parser().parse_args(
             [
                 "2026-09-11",
+                "测试群",
                 "output",
                 "--end-date",
                 "2026-09-12",
@@ -62,6 +64,7 @@ class ArgumentParserTests(unittest.TestCase):
         )
 
         self.assertEqual(args.end_date.isoformat(), "2026-09-12")
+        self.assertEqual(args.chat_name, "测试群")
         self.assertEqual(args.timezone, "Asia/Hong_Kong")
         self.assertEqual(args.env_file, Path("settings.env"))
         self.assertEqual(args.top_members, 10)
@@ -81,7 +84,8 @@ class GeneratePortraitTests(unittest.TestCase):
         captured: dict[str, object] = {}
 
         def export_markdown(*args: object, **kwargs: object) -> Path:
-            output_dir = args[2]
+            captured["chat_name"] = args[2]
+            output_dir = args[3]
             assert isinstance(output_dir, Path)
             markdown_path = output_dir / "transcript.md"
             markdown_path.write_text("# QQ 消息记录\n", encoding="utf-8")
@@ -136,6 +140,7 @@ class GeneratePortraitTests(unittest.TestCase):
                 paths = generate_portrait.generate_portrait(
                     generate_portrait.export_markdown.parse_date("2026-09-11"),
                     generate_portrait.export_markdown.parse_date("2026-09-11"),
+                    "测试群",
                     output_dir,
                     timezone=ZoneInfo("Asia/Shanghai"),
                     env_file=Path(".env"),
@@ -150,6 +155,7 @@ class GeneratePortraitTests(unittest.TestCase):
                 )
 
             self.assertEqual(paths, [captured["output_path"]])
+            self.assertEqual(captured["chat_name"], "测试群")
             self.assertTrue(output_dir.is_dir())
             self.assertEqual(
                 captured["render_options"],

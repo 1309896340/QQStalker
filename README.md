@@ -33,7 +33,7 @@ uv run python -m src.import_export C:\exports\my-chat
 按日期导出 Markdown 消息记录；`--end-date` 可选，省略时只导出当天：
 
 ```powershell
-uv run python -m src.export_markdown 2026-09-01 .\exports --end-date 2026-09-07
+uv run python -m src.export_markdown 2026-09-01 "群名" .\exports --end-date 2026-09-07
 ```
 
 使用本地 LLM 配置生成成员画像 HTML：
@@ -66,7 +66,7 @@ uv run python -m src.render_html_png .\analysis\portrait.html .\analysis --stitc
 分析生成的 HTML 则按既有时间戳命名逻辑保留在输出目录（例如 `analysis/`）中：
 
 ```powershell
-uv run python -m src.generate_portrait 2026-09-11 .\analysis
+uv run python -m src.generate_portrait 2026-09-11 "群名" .\analysis
 ```
 
 ## 工具说明

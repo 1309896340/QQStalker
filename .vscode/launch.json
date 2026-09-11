@@ -7,7 +7,7 @@
       "request": "launch",
       "module": "src.import_export",
       "args": [
-        "${workspaceFolder}/data/电影迷交流群"
+        "${workspaceFolder}/data/鸣潮萌新交流群_20260911_2224"
       ],
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
@@ -21,9 +21,10 @@
       "module": "src.export_markdown",
       "args": [
         "2026-09-09",
+        "鸣潮萌新交流群",
         "${workspaceFolder}/exports",
         "--end-date",
-        "2026-09-10"
+        "2026-09-30"
       ],
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
@@ -36,8 +37,12 @@
       "request": "launch",
       "module": "src.analyze_transcript",
       "args": [
-        "${workspaceFolder}/exports/20260910233118_消息记录.md",
-        "${workspaceFolder}/analysis"
+        "${workspaceFolder}/exports/20260911194123_消息记录.md",
+        "${workspaceFolder}/analysis",
+        "--min-message-count",
+        "5",
+        "--top-members",
+        "20"
       ],
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
@@ -50,12 +55,17 @@
       "request": "launch",
       "module": "src.render_html_png",
       "args": [
-        "${workspaceFolder}/analysis/20260911003736_群员画像.html",
-        "${workspaceFolder}/analysis/20260911003736_群员画像.png",
+        "${workspaceFolder}/analysis/20260911215036_群员画像.html",
+        "${workspaceFolder}/analysis/",
         "--dpi",
-        "300",
+        "200",
         "--width-mm",
-        "210"
+        "210",
+        "--max-height-px",
+        "4800",
+        "--stitch-horizontal",
+        "--stitch-count",
+        "4"
       ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
@@ -67,27 +77,24 @@
       "request": "launch",
       "module": "src.generate_portrait",
       "args": [
-        "2026-09-11",
+        "2026-09-09",
+        "鸣潮萌新交流群",
         "${workspaceFolder}/analysis",
-        // "--end-date",
-        // "2026-09-11",
-        // "--timezone",
-        // "Asia/Shanghai",
-        // "--env-file",
-        // "${workspaceFolder}/.env",
-        // "--top-members",
-        // "20",
-        // "--min-message-count",
-        // "0",
-        // "--dpi",
-        // "300",
-        // "--width-mm",
-        // "210",
-        // "--max-height-px",
-        // "30000",
-        // "--stitch-horizontal",
-        // "--stitch-count",
-        // "4"
+        "--end-date",
+        "2026-09-30",
+        "--top-members",
+        "20",
+        "--min-message-count",
+        "5",
+        "--dpi",
+        "200",
+        "--width-mm",
+        "210",
+        "--max-height-px",
+        "3200",
+        "--stitch-horizontal",
+        "--stitch-count",
+        "4"
       ],
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",

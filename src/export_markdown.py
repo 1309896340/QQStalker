@@ -111,6 +111,7 @@ def render_transcript(
 def export_markdown(
     start_date: date,
     end_date: date,
+    chat_name: str,
     output_dir: Path,
     *,
     timezone: ZoneInfo,
@@ -140,6 +141,7 @@ def export_markdown(
             isouter=True,
         )
         .where(
+            chat_table.c.name == chat_name,
             message_table.c.source_timestamp_ms >= start_timestamp,
             message_table.c.source_timestamp_ms < end_timestamp,
         )
@@ -150,7 +152,10 @@ def export_markdown(
         )
     )
 
+    chat_exists_statement = select(chat_table.c.id).where(chat_table.c.name == chat_name)
     with Session(create_database_engine()) as session:
+        if session.exec(chat_exists_statement).first() is None:
+            raise ValueError(f"群名不存在：{chat_name}")
         result_rows = session.exec(statement).all()
     rows: list[tuple[Message, str | None, str | None, str]] = [
         (message, display_name, group_card, chat_name)
@@ -175,6 +180,7 @@ def export_markdown(
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("start_date", type=parse_date, help="起始日期，格式 YYYY-MM-DD")
+    parser.add_argument("chat_name", help="必填，按名称筛选的群聊")
     parser.add_argument("output_dir", type=Path, help="Markdown 输出目录")
     parser.add_argument(
         "--end-date",
@@ -196,15 +202,15 @@ def main() -> None:
         raise SystemExit("--end-date 不能早于 start_date")
     try:
         timezone = ZoneInfo(args.timezone)
-    except ZoneInfoNotFoundError as error:
-        raise SystemExit(f"未知时区：{args.timezone}") from error
-
-    output_path = export_markdown(
-        args.start_date,
-        end_date,
-        args.output_dir,
-        timezone=timezone,
-    )
+        output_path = export_markdown(
+            args.start_date,
+            end_date,
+            args.chat_name,
+            args.output_dir,
+            timezone=timezone,
+        )
+    except (ValueError, ZoneInfoNotFoundError) as error:
+        raise SystemExit(str(error)) from error
     print(f"已导出消息记录：{output_path.resolve()}")
 
 

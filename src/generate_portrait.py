@@ -24,6 +24,7 @@ def environment_positive_integer(name: str, default: int) -> int:
 def generate_portrait(
     start_date: date,
     end_date: date,
+    chat_name: str,
     output_dir: Path,
     *,
     timezone: ZoneInfo,
@@ -40,31 +41,32 @@ def generate_portrait(
     """Export, analyze, and render portraits while keeping intermediate files temporary."""
 
     analyze_transcript.load_dotenv(env_file)
-    model = analyze_transcript.required_setting("LLM_MODEL")
-    resolved_dpi = (
-        dpi
-        if dpi is not None
-        else environment_positive_integer(
-            render_html_png.PNG_DPI_ENV,
-            render_html_png.DEFAULT_DPI,
-        )
-    )
-    resolved_max_height_pixels = (
-        max_height_pixels
-        if max_height_pixels is not None
-        else environment_positive_integer(
-            render_html_png.PNG_MAX_HEIGHT_PIXELS_ENV,
-            render_html_png.DEFAULT_MAX_HEIGHT_PIXELS,
-        )
-    )
 
     with tempfile.TemporaryDirectory(prefix="qqstalker-portrait-") as temporary_directory:
         temporary_dir = Path(temporary_directory)
         markdown_path = export_markdown.export_markdown(
             start_date,
             end_date,
+            chat_name,
             temporary_dir,
             timezone=timezone,
+        )
+        model = analyze_transcript.required_setting("LLM_MODEL")
+        resolved_dpi = (
+            dpi
+            if dpi is not None
+            else environment_positive_integer(
+                render_html_png.PNG_DPI_ENV,
+                render_html_png.DEFAULT_DPI,
+            )
+        )
+        resolved_max_height_pixels = (
+            max_height_pixels
+            if max_height_pixels is not None
+            else environment_positive_integer(
+                render_html_png.PNG_MAX_HEIGHT_PIXELS_ENV,
+                render_html_png.DEFAULT_MAX_HEIGHT_PIXELS,
+            )
         )
         analysis = analyze_transcript.analyze_all_members(
             markdown_path.read_text(encoding="utf-8"),
@@ -118,6 +120,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=export_markdown.parse_date,
         help="起始日期，格式 YYYY-MM-DD",
     )
+    parser.add_argument("chat_name", help="必填，按名称筛选的群聊")
     parser.add_argument("output_dir", type=Path, help="最终 PNG 输出目录")
     parser.add_argument(
         "--end-date",
@@ -208,6 +211,7 @@ def main() -> None:
         paths = generate_portrait(
             args.start_date,
             end_date,
+            args.chat_name,
             args.output_dir,
             timezone=timezone,
             env_file=args.env_file,
