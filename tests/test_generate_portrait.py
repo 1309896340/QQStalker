@@ -23,6 +23,7 @@ class ArgumentParserTests(unittest.TestCase):
         self.assertEqual(args.env_file, Path(".env"))
         self.assertIsNone(args.top_members)
         self.assertEqual(args.min_message_count, 0)
+        self.assertEqual(args.quote_count, 8)
         self.assertIsNone(args.dpi)
         self.assertEqual(args.width_mm, 210.0)
         self.assertIsNone(args.max_height_px)
@@ -46,6 +47,8 @@ class ArgumentParserTests(unittest.TestCase):
                 "10",
                 "--min-message-count",
                 "2",
+                "--quote-count",
+                "5",
                 "--dpi",
                 "144",
                 "--width-mm",
@@ -63,6 +66,7 @@ class ArgumentParserTests(unittest.TestCase):
         self.assertEqual(args.env_file, Path("settings.env"))
         self.assertEqual(args.top_members, 10)
         self.assertEqual(args.min_message_count, 2)
+        self.assertEqual(args.quote_count, 5)
         self.assertEqual(args.dpi, 144)
         self.assertEqual(args.width_mm, 180.0)
         self.assertEqual(args.max_height_px, 12000)
@@ -137,6 +141,7 @@ class GeneratePortraitTests(unittest.TestCase):
                     env_file=Path(".env"),
                     top_members=None,
                     min_message_count=0,
+                    quote_count=8,
                     dpi=None,
                     width_millimeters=210.0,
                     max_height_pixels=None,

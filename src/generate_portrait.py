@@ -30,6 +30,7 @@ def generate_portrait(
     env_file: Path,
     top_members: int | None,
     min_message_count: int,
+    quote_count: int,
     dpi: int | None,
     width_millimeters: float,
     max_height_pixels: int | None,
@@ -90,6 +91,7 @@ def generate_portrait(
             ),
             top_members=top_members,
             min_message_count=min_message_count,
+            quote_count=quote_count,
         )
         html_path = analyze_transcript.resolve_output_path(output_dir)
         html_path.parent.mkdir(parents=True, exist_ok=True)
@@ -152,6 +154,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="忽略发言数量少于 N 条的群员（默认：0）",
     )
     parser.add_argument(
+        "--quote-count",
+        type=analyze_transcript.positive_integer,
+        default=analyze_transcript.DEFAULT_FEATURED_QUOTE_COUNT,
+        help=(
+            "群聊高质量语录精选的目标条数"
+            f"（默认：{analyze_transcript.DEFAULT_FEATURED_QUOTE_COUNT}）"
+        ),
+    )
+    parser.add_argument(
         "--dpi",
         type=render_html_png.positive_integer,
         help=(
@@ -206,6 +217,7 @@ def main() -> None:
             env_file=args.env_file,
             top_members=args.top_members,
             min_message_count=args.min_message_count,
+            quote_count=args.quote_count,
             dpi=args.dpi,
             width_millimeters=args.width_mm,
             max_height_pixels=args.max_height_px,

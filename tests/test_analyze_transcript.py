@@ -81,6 +81,41 @@ class AnalysisDocumentTests(unittest.TestCase):
         self.assertIn("### 乙", analysis)
         self.assertNotIn("群员批次", analysis)
 
+    def test_appends_featured_quotes_after_member_portraits(self) -> None:
+        """The quote feature must form a dedicated final topic in the document."""
+
+        analysis = analyze_transcript.build_analysis_document(
+            member_count=1,
+            portraits=("### 甲\n- 简洁概括",),
+            featured_quotes="### 甲\n> 这也太逆天了\n\n- **点评**：荒诞反差强烈。",
+        )
+
+        self.assertIn("## 群聊高质量语录精选", analysis)
+        self.assertLess(analysis.index("### 甲"), analysis.index("## 群聊高质量语录精选"))
+
+
+class PromptTests(unittest.TestCase):
+    def test_requires_one_or_two_featured_viewpoints_for_each_member(self) -> None:
+        """Portrait prompts must request concise, evidence-grounded viewpoint selections."""
+
+        prompt = analyze_transcript.build_member_prompt((("甲", ["一条消息"]),))
+
+        self.assertIn("**精选语录**", prompt)
+        self.assertIn("1–2 条", prompt)
+        self.assertIn("忠实的简短转述", prompt)
+
+    def test_requests_high_quality_group_quotes(self) -> None:
+        """The quote prompt must follow the requested humorous and provocative criteria."""
+
+        prompt = analyze_transcript.build_featured_quotes_prompt(
+            "## 2026-09-11 09:00:00 · 测试群\n\n> **甲**\n>\n> 一条发言",
+            quote_count=8,
+        )
+
+        self.assertIn("幽默、讽刺或“逆天”程度", prompt)
+        self.assertIn("精选 8 条", prompt)
+        self.assertIn("成员名称", prompt)
+
 
 class PortraitNormalizationTests(unittest.TestCase):
     def test_replaces_verbose_activity_with_exact_message_count_and_removes_title(self) -> None:
@@ -124,8 +159,8 @@ class ActivitySummaryTests(unittest.TestCase):
 
 
 class ArgumentParserTests(unittest.TestCase):
-    def test_accepts_member_selection_options(self) -> None:
-        """The CLI must expose both member-selection controls to users."""
+    def test_accepts_member_selection_and_quote_options(self) -> None:
+        """The CLI must expose member selection and featured-quote controls."""
 
         args = analyze_transcript.build_argument_parser().parse_args(
             [
@@ -135,11 +170,14 @@ class ArgumentParserTests(unittest.TestCase):
                 "8",
                 "--min-message-count",
                 "3",
+                "--quote-count",
+                "5",
             ]
         )
 
         self.assertEqual(args.top_members, 8)
         self.assertEqual(args.min_message_count, 3)
+        self.assertEqual(args.quote_count, 5)
 
 
 if __name__ == "__main__":

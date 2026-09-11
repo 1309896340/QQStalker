@@ -42,6 +42,12 @@ uv run python -m src.export_markdown 2026-09-01 .\exports --end-date 2026-09-07
 uv run python -m src.analyze_transcript .\exports\2026-09-01.md .\analysis
 ```
 
+画像末尾会附加“群聊高质量语录精选”专题，默认目标为 8 条；使用 `--quote-count` 可调整数量：
+
+```powershell
+uv run python -m src.analyze_transcript .\exports\2026-09-01.md .\analysis --quote-count 12
+```
+
 将生成的 HTML 渲染为 PNG；第二个参数为输出目录，不存在时自动创建。图片将以
 `YYYYmmddHHMMSS_群员画像.png` 命名，超出最大高度时会自动生成带 `_1`、`_2` 等后缀的分片：
 
