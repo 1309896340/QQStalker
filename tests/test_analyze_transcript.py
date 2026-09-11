@@ -6,6 +6,32 @@ from src import analyze_transcript
 
 
 class SelectMembersTests(unittest.TestCase):
+    def test_excludes_service_and_system_members_during_extraction(self) -> None:
+        """Service and system senders must not contribute to portrait statistics."""
+
+        transcript = """## 2026-09-11 09:00:00 · 测试群
+
+> **普通成员**
+>
+> 大家好
+
+## 2026-09-11 09:01:00 · 测试群
+
+> **Q群管家**
+>
+> 入群提示
+
+## 2026-09-11 09:02:00 · 测试群
+
+> **系统消息**
+>
+> 系统通知
+"""
+
+        members = analyze_transcript.extract_member_messages(transcript)
+
+        self.assertEqual([member for member, _ in members], ["普通成员"])
+
     def test_filters_then_selects_most_active_members(self) -> None:
         """A low-volume member must not occupy a top-member slot."""
 
@@ -24,8 +50,8 @@ class SelectMembersTests(unittest.TestCase):
 
         self.assertEqual([member for member, _ in selected], ["乙", "丙"])
 
-    def test_keeps_source_order_when_top_members_is_omitted(self) -> None:
-        """Filtering alone must retain the transcript's first-seen member order."""
+    def test_sorts_by_message_share_when_top_members_is_omitted(self) -> None:
+        """The complete portrait list must rank members by message share."""
 
         members = [
             ("甲", ["a"] * 3),
@@ -39,7 +65,7 @@ class SelectMembersTests(unittest.TestCase):
             min_message_count=3,
         )
 
-        self.assertEqual([member for member, _ in selected], ["甲", "乙", "丙"])
+        self.assertEqual([member for member, _ in selected], ["乙", "丙", "甲"])
 
 
 class AnalysisDocumentTests(unittest.TestCase):

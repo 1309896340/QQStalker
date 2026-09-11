@@ -40,6 +40,7 @@ DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_MAX_TOKENS = 4_096
 DEFAULT_MEMBERS_PER_REQUEST = 6
 DEFAULT_MAX_INPUT_CHARACTERS = 24_000
+EXCLUDED_MEMBER_NAMES = frozenset({"Q群管家", "系统消息"})
 MESSAGE_BLOCK_PATTERN = re.compile(
     r"(?ms)^## [^\n]+\n\n> \*\*(?P<member>.+?)\*\*\n>\n.*?(?=^## |\Z)"
 )
@@ -164,7 +165,7 @@ def extract_member_messages(transcript: str) -> list[tuple[str, list[str]]]:
     members: dict[str, list[str]] = {}
     for match in MESSAGE_BLOCK_PATTERN.finditer(transcript):
         member = match.group("member").strip()
-        if member:
+        if member and member not in EXCLUDED_MEMBER_NAMES:
             members.setdefault(member, []).append(match.group(0).strip())
     if not members:
         raise RuntimeError("未能从消息记录中识别成员；请使用 export_markdown.py 生成的文件")
@@ -184,11 +185,10 @@ def select_members(
         for member, messages in members
         if len(messages) >= min_message_count
     ]
+    ranked = sorted(selected, key=lambda member_and_messages: -len(member_and_messages[1]))
     if top_members is None:
-        return selected
-    return sorted(selected, key=lambda member_and_messages: -len(member_and_messages[1]))[
-        :top_members
-    ]
+        return ranked
+    return ranked[:top_members]
 
 
 def build_member_prompt(member_batch: tuple[tuple[str, list[str]], ...]) -> str:
