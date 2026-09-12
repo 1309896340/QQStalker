@@ -103,7 +103,7 @@ def generate_portrait(
         )
         html_path.parent.mkdir(parents=True, exist_ok=True)
         html_path.write_text(
-            analyze_transcript.render_html(analysis),
+            analyze_transcript.render_html(analysis, chat_name=chat_name),
             encoding="utf-8",
         )
         output_path = render_html_png.create_output_path(
