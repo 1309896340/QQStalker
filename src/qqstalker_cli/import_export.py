@@ -1,4 +1,4 @@
-"""Import one archived QQChatExporter directory into PostgreSQL."""
+"""Import one or more QQChatExporter JSON exports into PostgreSQL."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import time
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from uuid import UUID
 
 import orjson
@@ -551,17 +551,42 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
         return imported_messages, skipped_messages
 
 
-def find_export_json(archive_dir: Path) -> Path:
-    """Return the single JSON export stored directly in an archive directory."""
+def find_export_jsons(archive_dir: Path) -> list[Path]:
+    """Return JSON exports stored directly in an archive directory by filename."""
 
     if not archive_dir.is_dir():
         raise FileNotFoundError(f"Archive directory does not exist: {archive_dir}")
-    json_files = sorted(archive_dir.glob("*.json"))
-    if len(json_files) != 1:
-        raise ValueError(
-            f"Expected exactly one JSON export in {archive_dir}, found {len(json_files)}."
+    json_files = sorted(
+        (
+            path
+            for path in archive_dir.iterdir()
+            if path.is_file() and path.suffix.casefold() == ".json"
+        ),
+        key=lambda path: (path.name.casefold(), path.name),
+    )
+    if not json_files:
+        raise ValueError(f"Expected at least one JSON export in {archive_dir}, found none.")
+    return json_files
+
+
+def synchronize_exports(
+    json_paths: Sequence[Path], images_dir: Path, engine: Engine
+) -> tuple[int, int]:
+    """Synchronize JSON exports one at a time and return aggregate message counts."""
+
+    imported_total = 0
+    skipped_total = 0
+    for export_index, json_path in enumerate(json_paths, start=1):
+        LOGGER.info(
+            "Importing JSON export %d/%d: %s",
+            export_index,
+            len(json_paths),
+            json_path.resolve(),
         )
-    return json_files[0]
+        imported, skipped = synchronize_export(json_path, images_dir, engine)
+        imported_total += imported
+        skipped_total += skipped
+    return imported_total, skipped_total
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -569,7 +594,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "archive_dir",
         type=Path,
-        help="Directory containing one QQChatExporter JSON file and resources/",
+        help="Directory containing QQChatExporter JSON files and resources/",
     )
     parser.add_argument(
         "--images-dir",
@@ -604,9 +629,10 @@ def main() -> None:
     configure_logging(args.log_file, args.log_level)
     stack_log = start_stall_monitor(args.log_file, args.stall_timeout)
     try:
-        json_path = find_export_json(args.archive_dir)
-        images_dir = args.images_dir or default_images_dir(json_path)
+        json_paths = find_export_jsons(args.archive_dir)
+        images_dir = args.images_dir or default_images_dir(json_paths[0])
         LOGGER.info("Archive directory: %s", args.archive_dir.resolve())
+        LOGGER.info("Found %d JSON export(s).", len(json_paths))
         LOGGER.info("Image directory: %s", images_dir.resolve())
         LOGGER.info(
             "Creating database engine for host=%s port=%s database=%s.",
@@ -614,7 +640,11 @@ def main() -> None:
             os.getenv("POSTGRES_PORT", "5432"),
             os.getenv("POSTGRES_DB", "qqstalker"),
         )
-        imported, skipped = synchronize_export(json_path, images_dir, create_database_engine())
+        imported, skipped = synchronize_exports(
+            json_paths,
+            images_dir,
+            create_database_engine(),
+        )
     except Exception:
         LOGGER.exception("Import failed. The preceding log entry identifies the last completed step.")
         raise
@@ -622,7 +652,12 @@ def main() -> None:
         faulthandler.cancel_dump_traceback_later()
         if stack_log is not None:
             stack_log.close()
-    LOGGER.info("Import complete: %d messages inserted, %d already present.", imported, skipped)
+    LOGGER.info(
+        "Import complete: %d JSON export(s), %d messages inserted, %d already present.",
+        len(json_paths),
+        imported,
+        skipped,
+    )
 
 
 if __name__ == "__main__":
