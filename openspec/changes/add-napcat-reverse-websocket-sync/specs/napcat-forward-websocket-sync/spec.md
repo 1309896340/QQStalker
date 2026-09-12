@@ -22,6 +22,13 @@
 - **WHEN** 已完成首次连接的服务与 NapCat 断开并处于重连状态
 - **THEN** `/healthz` 表示存活、`/readyz` 表示未就绪，且状态端点提供非敏感断线摘要
 
+### Requirement: Debug and container deployment
+系统 SHALL 提供加载本地 `.env` 的 VS Code 调试启动配置，用于运行 `src.qqstalker_realtime`。系统 SHALL 提供一个容器镜像和扩展现有 PostgreSQL Compose 部署的 `realtime` 服务。容器服务 MUST 使用 Compose 服务名连接 PostgreSQL，并 MUST 支持用单独的宿主机网关配置访问运行在宿主机的 NapCat；管理 API 仅发布到宿主机回环地址。
+
+#### Scenario: Docker Desktop deployment reaches host NapCat safely
+- **WHEN** 操作员使用 Compose 启动 PostgreSQL 与实时服务，且 NapCat 运行在 Docker Desktop 宿主机
+- **THEN** 实时容器通过配置的宿主机网关连接 NapCat，并通过 `postgres` 服务名连接共享数据库
+
 ### Requirement: Whitelisted group-message synchronization
 系统 SHALL 仅同步有效的 OneBot `post_type=message`、`message_type=group` 事件，且其 `group_id` 必须处于显式配置白名单内。系统 MUST 在单个事务中保存消息时间、来源标识、发送者、群名片、文本、数组消息段、@ 提及和可用资源元数据。空白名单 MUST 拒绝全部群消息；非群、非白名单、畸形和不支持事件 SHALL 被忽略且不得产生部分写入。
 

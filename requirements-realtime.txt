@@ -1,0 +1,6 @@
+# Pinned runtime subset from uv.lock for the realtime deployment image.
+fastapi==0.141.1
+psycopg[binary]==3.3.5
+sqlmodel==0.0.42
+uvicorn==0.52.4
+websockets==17.1

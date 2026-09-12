@@ -52,6 +52,10 @@ core 公开不依赖文件或 WS 的标准化消息持久化服务。每个事�
 
 语义为“连接期间至少处理一次、提交幂等”，不是恰好一次。离线期由 QQChatExporter CLI 补齐；不使用正文或时间猜测跨来源相同消息。
 
+### 6. 调试和 Compose 部署
+
+VS Code 调试配置以 `src.qqstalker_realtime` 模块启动服务，并使用 `.env`。现有 `database/docker-compose.yml` 扩展为同时编排 PostgreSQL 与 `realtime` 服务：实时容器以 `postgres:5432` 连接数据库，默认以 `host.docker.internal`（可由 `NAPCAT_DOCKER_WS_HOST` 覆盖）访问运行在 Docker Desktop 宿主机的 NapCat。镜像仅安装从 `uv.lock` 提取并固定版本的实时运行时依赖，避免携带画像渲染的 GUI 组件。状态 API 的端口映射固定绑定到宿主机 `127.0.0.1`；PostgreSQL 卷继续沿用该 Compose 项目已有卷。
+
 ## Risks / Trade-offs
 
 - [首次连接失败即退出] → 显示非机密地址参数，NapCat 恢复后由操作者重启服务。
@@ -59,6 +63,7 @@ core 公开不依赖文件或 WS 的标准化消息持久化服务。每个事�
 - [历史 `peer_uid` 与群号不一致] → 新建会话并告警，不做高风险合并。
 - [重构破坏脚本] → README、VS Code 调试配置和测试统一使用新入口；旧入口明确不再支持。
 - [token 或正文泄漏] → `.env` 读取、净化错误、拒绝记录事件正文 / URL，管理面回环绑定。
+- [容器无法访问宿主机 NapCat] → 使用独立的 `NAPCAT_DOCKER_WS_HOST`，默认 Docker Desktop 网关，避免复用容器内的 `127.0.0.1`。
 
 ## Migration Plan
 
@@ -68,6 +73,7 @@ core 公开不依赖文件或 WS 的标准化消息持久化服务。每个事�
 4. 在受控群验证首次失败、正常消息、白名单、撤回、断线重连和事务回滚。
 5. 启动 PostgreSQL 后核验存量 `peer_uid` 与目标群号；不匹配时接受新会话和告警。
 6. 回滚时停止服务；既有 CLI、库和已同步消息不自动删除。
+7. Compose 部署可使用 `down` 停止实时服务且保留 PostgreSQL 数据卷。
 
 ## Open Questions
 

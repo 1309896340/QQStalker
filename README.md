@@ -103,9 +103,28 @@ Invoke-RestMethod http://127.0.0.1:8010/readyz
 Invoke-RestMethod http://127.0.0.1:8010/sync/status
 ```
 
+### Docker Compose 部署
+
+若要将 PostgreSQL 与实时服务一起部署，使用仓库已有的 Compose 文件：
+
+```powershell
+docker compose -f database/docker-compose.yml up -d --build
+docker compose -f database/docker-compose.yml logs -f realtime
+```
+
+在 Docker Desktop 上，实时容器不能通过 `127.0.0.1` 访问运行在宿主机的 NapCat。Compose 会自动将 `NAPCAT_WS_HOST` 改为 `NAPCAT_DOCKER_WS_HOST`，其默认值为 `host.docker.internal`；只有 NapCat 不在宿主机时才需在 `.env` 修改该变量。PostgreSQL 数据继续使用原有 Compose 卷，管理 API 仍只发布到宿主机 `127.0.0.1`。
+
+停止服务而保留数据库数据：
+
+```powershell
+docker compose -f database/docker-compose.yml down
+```
+
 ## 包布局
 
 核心模型、数据库连接和通用持久化位于 `src.qqstalker_core`；文件导入、导出、分析和渲染 CLI 位于 `src.qqstalker_cli`；FastAPI/NapCat 服务位于 `src.qqstalker_realtime`。旧的 `python -m src.<command>` 入口已移除；请使用本文的新模块路径。
+
+VS Code 可从“运行和调试”中选择“NapCat 实时同步服务”来加载本地 `.env` 并启动同一服务。
 
 ## 工具说明
 

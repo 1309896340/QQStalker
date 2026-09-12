@@ -25,4 +25,5 @@
 
 - [x] 4.1 更新 README 和 `.env.example`，说明三包命令、NapCat WS Server、token 保密、白名单、首次失败、重连、状态端点和离线补齐；检查示例无真实凭据。
 - [x] 4.2 添加服务级集成测试，模拟本地 NapCat 发送白名单 / 非白名单消息、撤回、重复消息和失败，验证数据库和非敏感状态 API。
-- [ ] 4.3 使用脱敏 OneBot 样本和本机 NapCat 端到端演练，确认实时消息可被迁移后的 CLI 导出；执行 `uv run pyright`、`uv run python -m compileall -q src` 和完整测试集。
+- [x] 4.3 添加实时服务 VS Code 调试配置、Dockerfile 和 Compose 编排；验证 Compose 配置、容器构建与仅回环端口发布。
+- [ ] 4.4 使用脱敏 OneBot 样本和本机 NapCat 端到端演练，确认实时消息可被迁移后的 CLI 导出；执行 `uv run pyright`、`uv run python -m compileall -q src` 和完整测试集。

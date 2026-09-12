@@ -13,6 +13,7 @@
 - 处理群撤回 notice：目标消息已存在时保留正文并标记 `recalled=true`；目标不存在时忽略。
 - 实时事件优先按 `group_id` 匹配 `chats.peer_uid`；无法匹配则新建会话并告警，不启发式合并。
 - 提供仅本机监听的 `/healthz`、`/readyz`、`/sync/status`，并完善配置、文档和测试。
+- 为实时服务提供 VS Code 调试启动配置、容器镜像和 Compose 部署；容器使用服务名访问 PostgreSQL，并通过宿主机网关访问本机 NapCat。
 
 ## Capabilities
 

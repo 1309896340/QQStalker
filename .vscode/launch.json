@@ -100,6 +100,16 @@
       "envFile": "${workspaceFolder}/.env",
       "console": "integratedTerminal",
       "justMyCode": true
+    },
+    {
+      "name": "NapCat 实时同步服务",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "src.qqstalker_realtime",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
     }
   ]
 }
