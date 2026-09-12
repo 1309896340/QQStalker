@@ -7,7 +7,7 @@
       "request": "launch",
       "module": "src.qqstalker_cli.import_export",
       "args": [
-        "${workspaceFolder}/data/鸣潮萌新交流群_20260911_2224"
+        "C:/Users/13098/Documents/QQChatExporter/exports"
       ],
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
@@ -20,11 +20,11 @@
       "request": "launch",
       "module": "src.qqstalker_cli.export_markdown",
       "args": [
-        "2026-09-09",
-        "鸣潮萌新交流群",
+        "2026-09-12",
+        "电影迷交流群",
         "${workspaceFolder}/exports",
-        "--end-date",
-        "2026-09-30"
+        // "--end-date",
+        // "2026-09-30"
       ],
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
@@ -77,11 +77,12 @@
       "request": "launch",
       "module": "src.qqstalker_cli.generate_portrait",
       "args": [
-        "2026-09-09",
-        "鸣潮萌新交流群",
+        "2026-09-12",
+        // "电影迷交流群",
+        "c++中文周刊交流群",
         "${workspaceFolder}/analysis",
-        "--end-date",
-        "2026-09-30",
+        // "--end-date",
+        // "2026-09-30",
         "--top-members",
         "20",
         "--min-message-count",
@@ -91,7 +92,7 @@
         "--width-mm",
         "210",
         "--max-height-px",
-        "3200",
+        "4500",
         "--stitch-horizontal",
         "--stitch-count",
         "4"
