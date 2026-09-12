@@ -124,6 +124,17 @@ class PromptTests(unittest.TestCase):
         self.assertIn("去除后没有文字内容的发言不得入选", prompt)
 
 
+class BatchProgressTests(unittest.TestCase):
+    def test_formats_all_member_names_in_batch_order(self) -> None:
+        """Batch progress must identify every member included in the request."""
+
+        names = analyze_transcript.format_member_batch_names(
+            (("甲", ["消息"]), ("乙", ["消息"]), ("丙", ["消息"]))
+        )
+
+        self.assertEqual(names, "甲、乙、丙")
+
+
 class HtmlRenderingTests(unittest.TestCase):
     def test_footer_only_shows_timezone_free_generation_time(self) -> None:
         """Generated HTML must not expose its source path or model configuration."""

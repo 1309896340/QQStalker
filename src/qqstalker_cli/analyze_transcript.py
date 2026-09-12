@@ -329,6 +329,12 @@ def batch_members(
     return batches
 
 
+def format_member_batch_names(member_batch: tuple[tuple[str, list[str]], ...]) -> str:
+    """Format the displayed names for a batch-progress message."""
+
+    return "、".join(member for member, _ in member_batch)
+
+
 def extract_text(value: object) -> str:
     """Extract text from a string or OpenAI-compatible content-part collection."""
 
@@ -591,6 +597,7 @@ def analyze_all_members(
             f"（{len(member_batch)} 人、{message_count} 条消息）",
             flush=True,
         )
+        print(f"本批次群员：{format_member_batch_names(member_batch)}", flush=True)
         batch_analysis = analyze_member_batch(
             member_batch,
             base_url=base_url,
