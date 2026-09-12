@@ -210,5 +210,31 @@ class ArgumentParserTests(unittest.TestCase):
         self.assertEqual(args.quote_count, 5)
 
 
+class LlmErrorTests(unittest.TestCase):
+    def test_explains_unsupported_ark_agent_plan_model(self) -> None:
+        """Ark Plan incompatibility must point to the compatible configuration choices."""
+
+        message = analyze_transcript.format_llm_http_error(
+            base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
+            status_code=404,
+            detail='{"error":{"code":"UnsupportedModel"}}',
+        )
+
+        self.assertIn("Agent Plan", message)
+        self.assertIn("https://ark.cn-beijing.volces.com/api/v3", message)
+        self.assertNotIn("UnsupportedModel", message)
+
+    def test_keeps_non_plan_errors_intact(self) -> None:
+        """Unrelated provider errors must retain their diagnostic response body."""
+
+        message = analyze_transcript.format_llm_http_error(
+            base_url="https://api.openai.com/v1",
+            status_code=401,
+            detail="invalid credentials",
+        )
+
+        self.assertEqual(message, "大模型请求失败（HTTP 401）：invalid credentials")
+
+
 if __name__ == "__main__":
     unittest.main()

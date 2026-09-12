@@ -396,6 +396,25 @@ def response_shape_summary(response_data: dict[str, Any]) -> str:
     )
 
 
+def format_llm_http_error(*, base_url: str, status_code: int, detail: str) -> str:
+    """Return an actionable error without exposing the configured API key."""
+
+    normalized_base_url = base_url.rstrip("/").lower()
+    if (
+        status_code == 404
+        and "/api/plan/" in normalized_base_url
+        and "unsupportedmodel" in detail.lower()
+    ):
+        return (
+            "大模型请求被火山引擎 Ark Agent Plan 拒绝：当前 LLM_MODEL 不支持 "
+            "Agent Plan。请使用方舟控制台中标为支持 Agent Plan 的模型；或者，"
+            "对于本工具这种普通的单轮 Chat Completions 调用，将 LLM_BASE_URL 改为"
+            "标准 Ark 接口基础地址（例如 https://ark.cn-beijing.volces.com/api/v3），"
+            "并将 LLM_MODEL 配置为已创建的推理接入点 ID。"
+        )
+    return f"大模型请求失败（HTTP {status_code}）：{detail}"
+
+
 def request_portraits(
     prompt: str,
     *,
@@ -424,7 +443,13 @@ def request_portraits(
             response.raise_for_status()
     except httpx.HTTPStatusError as error:
         detail = error.response.text[:1_000]
-        raise RuntimeError(f"大模型请求失败（HTTP {error.response.status_code}）：{detail}") from error
+        raise RuntimeError(
+            format_llm_http_error(
+                base_url=base_url,
+                status_code=error.response.status_code,
+                detail=detail,
+            )
+        ) from error
     except httpx.HTTPError as error:
         raise RuntimeError(f"无法连接大模型服务：{error}") from error
 
