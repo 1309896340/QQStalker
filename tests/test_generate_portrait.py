@@ -1,6 +1,7 @@
 """Tests for the all-in-one portrait generation command."""
 
 import os
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -99,6 +100,27 @@ class GeneratePortraitTests(unittest.TestCase):
             self.assertTrue(input_html.is_file())
             return [output_path]
 
+        generated_at = datetime(2026, 9, 11, 8, 30, 45)
+
+        def resolve_output_path(
+            output_dir: Path,
+            *,
+            generated_at: datetime,
+            chat_name: str,
+        ) -> Path:
+            captured["html_name_options"] = (generated_at, chat_name)
+            return output_dir / f"{generated_at:%Y%m%d%H%M%S}_{chat_name}.html"
+
+        def create_output_path(
+            output_dir: Path,
+            *,
+            generated_at: datetime,
+            chat_name: str,
+        ) -> Path:
+            captured["png_name_options"] = (generated_at, chat_name)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            return output_dir / f"{generated_at:%Y%m%d%H%M%S}_{chat_name}.png"
+
         with TemporaryDirectory() as temporary_directory:
             output_dir = Path(temporary_directory) / "output"
             with (
@@ -125,7 +147,11 @@ class GeneratePortraitTests(unittest.TestCase):
                 ),
                 patch(
                     "src.generate_portrait.analyze_transcript.resolve_output_path",
-                    side_effect=lambda output_dir: output_dir / "20260911083045_群员画像.html",
+                    side_effect=resolve_output_path,
+                ),
+                patch(
+                    "src.generate_portrait.render_html_png.create_output_path",
+                    side_effect=create_output_path,
                 ),
                 patch(
                     "src.generate_portrait.render_html_png.render_html_to_pngs",
@@ -136,7 +162,12 @@ class GeneratePortraitTests(unittest.TestCase):
                     {"PNG_DPI": "144", "PNG_MAX_HEIGHT_PIXELS": "12000"},
                     clear=False,
                 ),
+                patch(
+                    "src.generate_portrait.datetime",
+                    wraps=datetime,
+                ) as mocked_datetime,
             ):
+                mocked_datetime.now.return_value = generated_at
                 paths = generate_portrait.generate_portrait(
                     generate_portrait.export_markdown.parse_date("2026-09-11"),
                     generate_portrait.export_markdown.parse_date("2026-09-11"),
@@ -156,6 +187,8 @@ class GeneratePortraitTests(unittest.TestCase):
 
             self.assertEqual(paths, [captured["output_path"]])
             self.assertEqual(captured["chat_name"], "测试群")
+            self.assertEqual(captured["html_name_options"], (generated_at, "测试群"))
+            self.assertEqual(captured["png_name_options"], (generated_at, "测试群"))
             self.assertTrue(output_dir.is_dir())
             self.assertEqual(
                 captured["render_options"],

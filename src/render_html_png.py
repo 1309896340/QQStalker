@@ -54,14 +54,19 @@ def css_pixels_for_millimeters(width_millimeters: float) -> int:
     return max(1, round(width_millimeters / 25.4 * CSS_PIXELS_PER_INCH))
 
 
-def create_output_path(output_dir: Path, *, generated_at: datetime | None = None) -> Path:
+def create_output_path(
+    output_dir: Path,
+    *,
+    generated_at: datetime | None = None,
+    chat_name: str | None = None,
+) -> Path:
     """Create the output directory and return its timestamped PNG path."""
 
     if output_dir.exists() and not output_dir.is_dir():
         raise ValueError("输出路径必须是文件夹")
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = (generated_at or datetime.now()).strftime("%Y%m%d%H%M%S")
-    return output_dir / f"{timestamp}_群员画像.png"
+    return output_dir / f"{timestamp}_{chat_name or '群员画像'}.png"
 
 
 def output_paths(output_path: Path, segment_count: int) -> list[Path]:

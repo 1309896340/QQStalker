@@ -90,6 +90,18 @@ class ArgumentParserTests(unittest.TestCase):
             self.assertTrue(output_dir.is_dir())
             self.assertEqual(output_path.name, "20260911083045_群员画像.png")
 
+    def test_uses_the_group_name_when_provided(self) -> None:
+        """The portrait pipeline can name PNG output after its selected chat."""
+
+        with TemporaryDirectory() as temporary_directory:
+            output_path = render_html_png.create_output_path(
+                Path(temporary_directory),
+                generated_at=datetime(2026, 9, 11, 8, 30, 45),
+                chat_name="测试群",
+            )
+
+        self.assertEqual(output_path.name, "20260911083045_测试群.png")
+
     def test_numbers_split_output_paths(self) -> None:
         """Split renders append one-based sequence suffixes to the base filename."""
 

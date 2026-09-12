@@ -13,6 +13,8 @@ dependencies = [
     "markdown>=3.10.3",
     "bleach>=6.4.0",
     "playwright>=1.57.0",
+    "pyside6>=6.11.2",
+    "fastapi[standard]>=0.141.1",
 ]
 
 [dependency-groups]

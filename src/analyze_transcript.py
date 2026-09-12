@@ -703,12 +703,18 @@ def render_html(analysis: str) -> str:
 """
 
 
-def resolve_output_path(output_path: Path) -> Path:
+def resolve_output_path(
+    output_path: Path,
+    *,
+    generated_at: datetime | None = None,
+    chat_name: str | None = None,
+) -> Path:
     """Use a timestamped HTML filename when the output argument is a directory."""
 
     if output_path.suffix:
         return output_path
-    filename = datetime.now().strftime("%Y%m%d%H%M%S_群员画像.html")
+    timestamp = (generated_at or datetime.now()).strftime("%Y%m%d%H%M%S")
+    filename = f"{timestamp}_{chat_name or '群员画像'}.html"
     return output_path / filename
 
 

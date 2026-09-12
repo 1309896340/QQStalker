@@ -63,7 +63,8 @@ uv run python -m src.render_html_png .\analysis\portrait.html .\analysis --stitc
 ```
 
 如需从数据库消息记录直接生成最终 PNG，可使用整合命令；Markdown 中间文件会自动清理，
-分析生成的 HTML 则按既有时间戳命名逻辑保留在输出目录（例如 `analysis/`）中：
+分析生成的 HTML 与 PNG 会保留在输出目录（例如 `analysis/`）中，并使用
+`YYYYmmddHHMMSS_<群名>.html`、`YYYYmmddHHMMSS_<群名>.png` 命名：
 
 ```powershell
 uv run python -m src.generate_portrait 2026-09-11 "群名" .\analysis

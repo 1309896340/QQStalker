@@ -1,5 +1,7 @@
 """Tests for transcript member selection and portrait-document assembly."""
 
+from datetime import datetime
+from pathlib import Path
 import unittest
 
 from src import analyze_transcript
@@ -132,6 +134,17 @@ class HtmlRenderingTests(unittest.TestCase):
         self.assertNotIn("消息记录：", rendered)
         self.assertNotIn("模型：<code>", rendered)
         self.assertNotIn("中国标准时间", rendered)
+
+    def test_directory_output_uses_the_group_name_when_provided(self) -> None:
+        """The pipeline can use the selected chat name in its cached HTML filename."""
+
+        output_path = analyze_transcript.resolve_output_path(
+            Path("analysis"),
+            generated_at=datetime(2026, 9, 11, 8, 30, 45),
+            chat_name="测试群",
+        )
+
+        self.assertEqual(output_path, Path("analysis/20260911083045_测试群.html"))
 
 
 class PortraitNormalizationTests(unittest.TestCase):

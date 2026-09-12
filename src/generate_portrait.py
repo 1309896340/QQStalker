@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import tempfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -95,13 +95,22 @@ def generate_portrait(
             min_message_count=min_message_count,
             quote_count=quote_count,
         )
-        html_path = analyze_transcript.resolve_output_path(output_dir)
+        generated_at = datetime.now()
+        html_path = analyze_transcript.resolve_output_path(
+            output_dir,
+            generated_at=generated_at,
+            chat_name=chat_name,
+        )
         html_path.parent.mkdir(parents=True, exist_ok=True)
         html_path.write_text(
             analyze_transcript.render_html(analysis),
             encoding="utf-8",
         )
-        output_path = render_html_png.create_output_path(output_dir)
+        output_path = render_html_png.create_output_path(
+            output_dir,
+            generated_at=generated_at,
+            chat_name=chat_name,
+        )
         return render_html_png.render_html_to_pngs(
             html_path,
             output_path,
