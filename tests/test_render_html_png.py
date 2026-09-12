@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from src import render_html_png
+from src.qqstalker_cli import render_html_png
 
 
 class ArgumentParserTests(unittest.TestCase):

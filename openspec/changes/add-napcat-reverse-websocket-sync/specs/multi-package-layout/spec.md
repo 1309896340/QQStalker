@@ -1,6 +1,6 @@
 ## Purpose
 
-将 QQStalker 的共享数据能力、既有命令行工具和实时服务划分为明确包边界，使两种采集方式共享数据库语义，并为现有 CLI 提供迁移期兼容性。
+将 QQStalker 的共享数据能力、既有命令行工具和实时服务划分为明确包边界，使两种采集方式共享数据库语义，并使用唯一、明确的 CLI 模块入口。
 
 ## ADDED Requirements
 
@@ -15,13 +15,13 @@
 - **WHEN** 操作员启动实时服务
 - **THEN** 服务无需执行文件导入、分析或渲染 CLI 即可运行
 
-### Requirement: CLI migration compatibility
-系统 SHALL 为当前 `src.import_export`、`src.export_markdown`、`src.analyze_transcript`、`src.render_html_png` 和 `src.generate_portrait` 提供一个发布周期的兼容转发入口。兼容入口 MUST 调用迁移后的实现并显示迁移提示；新文档 MUST 使用新的 CLI 包路径。原有 CLI 的可观察行为不得因重构改变。
-
-#### Scenario: Existing command remains usable
-- **WHEN** 操作员运行当前形式的 `python -m src.<command>`
-- **THEN** 命令完成等价操作并显示迁移提示，而不会因模块移动失败
+### Requirement: CLI uses only its migrated package paths
+系统 SHALL 仅从 `src.qqstalker_cli` 提供文件导入、导出、分析和渲染命令。系统 MUST NOT 提供 `src.import_export`、`src.export_markdown`、`src.analyze_transcript`、`src.render_html_png`、`src.generate_portrait` 或 `src.parse_export` 的兼容转发模块。README 和 VS Code 调试配置 MUST 使用新的 CLI 包路径。
 
 #### Scenario: New package command works
 - **WHEN** 操作员按 README 的新 CLI 包路径执行同一命令
 - **THEN** 命令无需兼容包装器即可成功运行
+
+#### Scenario: Legacy command is unavailable
+- **WHEN** 操作员运行旧的 `python -m src.<command>` 形式
+- **THEN** Python 找不到该旧模块，且不会再运行兼容转发逻辑

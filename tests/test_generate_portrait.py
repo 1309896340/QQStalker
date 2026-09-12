@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from src import generate_portrait
+from src.qqstalker_cli import generate_portrait
 
 
 class ArgumentParserTests(unittest.TestCase):
@@ -124,37 +124,37 @@ class GeneratePortraitTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             output_dir = Path(temporary_directory) / "output"
             with (
-                patch("src.generate_portrait.analyze_transcript.load_dotenv"),
+                patch("src.qqstalker_cli.generate_portrait.analyze_transcript.load_dotenv"),
                 patch(
-                    "src.generate_portrait.analyze_transcript.required_setting",
+                    "src.qqstalker_cli.generate_portrait.analyze_transcript.required_setting",
                     side_effect=lambda name: f"value-for-{name}",
                 ),
                 patch(
-                    "src.generate_portrait.analyze_transcript.positive_integer_setting",
+                    "src.qqstalker_cli.generate_portrait.analyze_transcript.positive_integer_setting",
                     side_effect=lambda _name, default: default,
                 ),
                 patch(
-                    "src.generate_portrait.export_markdown.export_markdown",
+                    "src.qqstalker_cli.generate_portrait.export_markdown.export_markdown",
                     side_effect=export_markdown,
                 ),
                 patch(
-                    "src.generate_portrait.analyze_transcript.analyze_all_members",
+                    "src.qqstalker_cli.generate_portrait.analyze_transcript.analyze_all_members",
                     return_value="# 群员画像分析",
                 ),
                 patch(
-                    "src.generate_portrait.analyze_transcript.render_html",
+                    "src.qqstalker_cli.generate_portrait.analyze_transcript.render_html",
                     return_value="<html></html>",
                 ),
                 patch(
-                    "src.generate_portrait.analyze_transcript.resolve_output_path",
+                    "src.qqstalker_cli.generate_portrait.analyze_transcript.resolve_output_path",
                     side_effect=resolve_output_path,
                 ),
                 patch(
-                    "src.generate_portrait.render_html_png.create_output_path",
+                    "src.qqstalker_cli.generate_portrait.render_html_png.create_output_path",
                     side_effect=create_output_path,
                 ),
                 patch(
-                    "src.generate_portrait.render_html_png.render_html_to_pngs",
+                    "src.qqstalker_cli.generate_portrait.render_html_png.render_html_to_pngs",
                     side_effect=render_html_to_pngs,
                 ),
                 patch.dict(
@@ -163,7 +163,7 @@ class GeneratePortraitTests(unittest.TestCase):
                     clear=False,
                 ),
                 patch(
-                    "src.generate_portrait.datetime",
+                    "src.qqstalker_cli.generate_portrait.datetime",
                     wraps=datetime,
                 ) as mocked_datetime,
             ):

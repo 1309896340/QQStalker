@@ -16,10 +16,10 @@ from typing import Any
 from uuid import UUID
 
 import orjson
-from sqlalchemy import Engine, URL
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlalchemy import Engine
+from sqlmodel import Session, SQLModel, select
 
-from src.models import (
+from src.qqstalker_core.models import (
     BinaryResource,
     Chat,
     ChatMembership,
@@ -30,57 +30,21 @@ from src.models import (
     MessageResource,
     Participant,
 )
-from src.parse_export import default_images_dir
-from src.schemas.qq_export import MessageResource as ExportedResource
-from src.schemas.qq_export import QQChatExport, QQMessage
+from src.qqstalker_core.database import create_database_engine, database_url_from_environment
+from src.qqstalker_core.persistence import (
+    ensure_chat_membership,
+    get_or_create_participant,
+    sanitize_postgres_json,
+    sanitize_postgres_text,
+)
+from src.qqstalker_cli.parse_export import default_images_dir
+from src.qqstalker_core.schemas.qq_export import MessageResource as ExportedResource
+from src.qqstalker_core.schemas.qq_export import QQChatExport, QQMessage
 
 BATCH_SIZE = 500
 PROGRESS_INTERVAL = 100
 DEFAULT_LOG_PATH = Path("logs") / "import_export.log"
 LOGGER = logging.getLogger("qqstalker.import_export")
-
-
-def sanitize_postgres_text(value: str | None, *, field_path: str) -> str | None:
-    """Remove NUL bytes, which PostgreSQL cannot store in text or JSON values."""
-
-    if value is None or "\x00" not in value:
-        return value
-
-    removed = value.count("\x00")
-    LOGGER.warning(
-        "Removed %d NUL byte(s) before database insert: %s.",
-        removed,
-        field_path,
-    )
-    return value.replace("\x00", "")
-
-
-def sanitize_postgres_json(value: Any, *, field_path: str) -> Any:
-    """Recursively remove PostgreSQL-incompatible NUL bytes from JSON data."""
-
-    if isinstance(value, str):
-        return sanitize_postgres_text(value, field_path=field_path)
-    if isinstance(value, dict):
-        sanitized: dict[Any, Any] = {}
-        for key, item in value.items():
-            sanitized_key = sanitize_postgres_text(str(key), field_path=f"{field_path}.<key>")
-            assert sanitized_key is not None
-            sanitized[sanitized_key] = sanitize_postgres_json(
-                item,
-                field_path=f"{field_path}.{sanitized_key}",
-            )
-        return sanitized
-    if isinstance(value, list):
-        return [
-            sanitize_postgres_json(item, field_path=f"{field_path}[{index}]")
-            for index, item in enumerate(value)
-        ]
-    if isinstance(value, tuple):
-        return [
-            sanitize_postgres_json(item, field_path=f"{field_path}[{index}]")
-            for index, item in enumerate(value)
-        ]
-    return value
 
 
 def configure_logging(log_file: Path, log_level: str) -> None:
@@ -136,39 +100,6 @@ def start_stall_monitor(log_file: Path, timeout_seconds: int):
     return stack_log
 
 
-def database_url_from_environment() -> str | URL:
-    """Build a psycopg URL from DATABASE_URL or the Compose environment variables."""
-
-    configured_url = os.getenv("DATABASE_URL")
-    if configured_url:
-        return configured_url
-
-    database = os.getenv("POSTGRES_DB", "qqstalker")
-    user = os.getenv("POSTGRES_USER", "qqstalker")
-    password = os.getenv("POSTGRES_PASSWORD")
-    if not password:
-        raise RuntimeError("Set DATABASE_URL or POSTGRES_PASSWORD before importing.")
-
-    host = os.getenv("POSTGRES_HOST", "localhost")
-    port = os.getenv("POSTGRES_PORT", "5432")
-    return URL.create(
-        "postgresql+psycopg",
-        username=user,
-        password=password,
-        host=host,
-        port=int(port),
-        database=database,
-    )
-
-
-def create_database_engine() -> Engine:
-    return create_engine(
-        database_url_from_environment(),
-        pool_pre_ping=True,
-        connect_args={"connect_timeout": 10},
-    )
-
-
 def resolve_resource_path(
     resource: ExportedResource,
     *,
@@ -202,55 +133,6 @@ def resolve_resource_path(
         ):
             return resolved
     return None
-
-
-def get_or_create_participant(
-    session: Session,
-    sender_uid: str,
-    *,
-    uin: str | None,
-    display_name: str,
-    nickname: str | None,
-    participant_ids: dict[str, UUID],
-) -> UUID:
-    sender_uid = sanitize_postgres_text(sender_uid, field_path="participant.uid") or ""
-    uin = sanitize_postgres_text(uin, field_path=f"participant[{sender_uid}].uin")
-    display_name = (
-        sanitize_postgres_text(
-            display_name,
-            field_path=f"participant[{sender_uid}].display_name",
-        )
-        or ""
-    )
-    nickname = sanitize_postgres_text(
-        nickname,
-        field_path=f"participant[{sender_uid}].nickname",
-    )
-    if sender_uid in participant_ids:
-        return participant_ids[sender_uid]
-
-    with session.no_autoflush:
-        participant = session.exec(
-            select(Participant).where(Participant.uid == sender_uid)
-        ).first()
-    if participant is None:
-        participant = Participant(
-            uid=sender_uid,
-            uin=uin,
-            display_name=display_name,
-            nickname=nickname,
-        )
-        session.add(participant)
-        # Mentions and memberships reference this row by UUID in the same transaction.
-        session.flush()
-    else:
-        participant.uin = uin or participant.uin
-        participant.display_name = display_name
-        participant.nickname = nickname or participant.nickname
-        participant.updated_at = datetime.now(UTC)
-
-    participant_ids[sender_uid] = participant.id
-    return participant.id
 
 
 def get_or_create_binary_resource(
@@ -301,41 +183,6 @@ def get_or_create_binary_resource(
     binary_ids[checksum] = binary_resource.id
     binary_file_ids[resolved_path] = binary_resource.id
     return binary_resource.id
-
-
-def ensure_chat_membership(
-    session: Session,
-    *,
-    chat_id: UUID,
-    participant_id: UUID,
-    group_card: str | None,
-    membership_keys: set[tuple[UUID, UUID]],
-) -> None:
-    group_card = sanitize_postgres_text(group_card, field_path="chat_membership.group_card")
-    key = (chat_id, participant_id)
-    if key in membership_keys:
-        return
-
-    membership = session.exec(
-        select(ChatMembership).where(
-            ChatMembership.chat_id == chat_id,
-            ChatMembership.participant_id == participant_id,
-        )
-    ).first()
-    if membership is None:
-        session.add(
-            ChatMembership(
-                chat_id=chat_id,
-                participant_id=participant_id,
-                group_card=group_card,
-                first_seen_at=datetime.now(UTC),
-                last_seen_at=datetime.now(UTC),
-            )
-        )
-    else:
-        membership.group_card = group_card or membership.group_card
-        membership.last_seen_at = datetime.now(UTC)
-    membership_keys.add(key)
 
 
 def synchronize_message(

@@ -5,7 +5,7 @@
       "name": "读取json上传数据库",
       "type": "debugpy",
       "request": "launch",
-      "module": "src.import_export",
+      "module": "src.qqstalker_cli.import_export",
       "args": [
         "${workspaceFolder}/data/鸣潮萌新交流群_20260911_2224"
       ],
@@ -18,7 +18,7 @@
       "name": "从数据库筛选导出消息记录",
       "type": "debugpy",
       "request": "launch",
-      "module": "src.export_markdown",
+      "module": "src.qqstalker_cli.export_markdown",
       "args": [
         "2026-09-09",
         "鸣潮萌新交流群",
@@ -35,7 +35,7 @@
       "name": "AI 分析群员画像",
       "type": "debugpy",
       "request": "launch",
-      "module": "src.analyze_transcript",
+      "module": "src.qqstalker_cli.analyze_transcript",
       "args": [
         "${workspaceFolder}/exports/20260911194123_消息记录.md",
         "${workspaceFolder}/analysis",
@@ -53,7 +53,7 @@
       "name": "将群员画像 HTML 渲染为 PNG",
       "type": "debugpy",
       "request": "launch",
-      "module": "src.render_html_png",
+      "module": "src.qqstalker_cli.render_html_png",
       "args": [
         "${workspaceFolder}/analysis/20260911215036_群员画像.html",
         "${workspaceFolder}/analysis/",
@@ -75,7 +75,7 @@
       "name": "一键生成群员画像 PNG",
       "type": "debugpy",
       "request": "launch",
-      "module": "src.generate_portrait",
+      "module": "src.qqstalker_cli.generate_portrait",
       "args": [
         "2026-09-09",
         "鸣潮萌新交流群",

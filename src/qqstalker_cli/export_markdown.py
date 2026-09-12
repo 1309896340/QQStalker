@@ -10,8 +10,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlmodel import Session, select
 
-from src.import_export import create_database_engine
-from src.models import Chat, ChatMembership, Message, Participant
+from src.qqstalker_core.database import create_database_engine
+from src.qqstalker_core.models import Chat, ChatMembership, Message, Participant
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 

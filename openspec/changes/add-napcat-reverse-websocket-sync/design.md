@@ -21,21 +21,16 @@
 
 ## Decisions
 
-### 1. 三包结构和转发层
+### 1. 三包结构
 
 ```text
 src/
   qqstalker_core/       # models, database, normalized inputs, persistence
   qqstalker_cli/        # import, export, analysis, rendering
   qqstalker_realtime/   # FastAPI, OneBot schemas, NapCat WS client
-  import_export.py      # one-release compatibility wrappers
-  export_markdown.py
-  analyze_transcript.py
-  render_html_png.py
-  generate_portrait.py
 ```
 
-core 仅提供模型、连接与事务 API；CLI 和 realtime 为平级消费者。包装器保留旧模块命令并提示迁移，新旧入口均有回归测试。保留平铺模块并只加服务会继续耦合文件导入细节，故不采用；拆成独立 Python 项目会增加共享模型维护成本，也不采用。
+core 仅提供模型、连接与事务 API；CLI 和 realtime 为平级消费者。旧的平铺模块和兼容包装器直接移除，README 与 VS Code 调试配置统一使用新模块路径。保留平铺模块并只加服务会继续耦合文件导入细节，故不采用；拆成独立 Python 项目会增加共享模型维护成本，也不采用。
 
 ### 2. FastAPI lifespan 和正向 WS 客户端
 
@@ -62,12 +57,12 @@ core 公开不依赖文件或 WS 的标准化消息持久化服务。每个事�
 - [首次连接失败即退出] → 显示非机密地址参数，NapCat 恢复后由操作者重启服务。
 - [断线缺口] → 保留 CLI 补齐；缺失目标的撤回有意忽略，避免伪造内容。
 - [历史 `peer_uid` 与群号不一致] → 新建会话并告警，不做高风险合并。
-- [重构破坏脚本] → 一个发布周期的包装器和新旧入口测试。
+- [重构破坏脚本] → README、VS Code 调试配置和测试统一使用新入口；旧入口明确不再支持。
 - [token 或正文泄漏] → `.env` 读取、净化错误、拒绝记录事件正文 / URL，管理面回环绑定。
 
 ## Migration Plan
 
-1. 创建三包和兼容包装器，迁移测试并验证旧 CLI 等价。
+1. 创建三包，迁移测试、README 和 VS Code 调试配置至新 CLI 入口，并删除旧模块。
 2. 抽取共享数据库 / 持久化层，确认表名和历史数据不变。
 3. 实现 FastAPI 预检、正向 WS 客户端、状态 API 与 OneBot fixtures。
 4. 在受控群验证首次失败、正常消息、白名单、撤回、断线重连和事务回滚。

@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
-from src import export_markdown
+from src.qqstalker_cli import export_markdown
 
 
 class ArgumentParserTests(unittest.TestCase):
@@ -33,8 +33,8 @@ class GroupValidationTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             output_dir = Path(temporary_directory) / "exports"
             with (
-                patch("src.export_markdown.create_database_engine", return_value=object()),
-                patch("src.export_markdown.Session", return_value=session_context),
+                patch("src.qqstalker_cli.export_markdown.create_database_engine", return_value=object()),
+                patch("src.qqstalker_cli.export_markdown.Session", return_value=session_context),
             ):
                 with self.assertRaisesRegex(ValueError, "群名不存在：不存在的群"):
                     export_markdown.export_markdown(

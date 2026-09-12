@@ -6,7 +6,7 @@
 
 ## What Changes
 
-- 将代码重组为单一 `pyproject.toml` 管理的 `qqstalker_core`、`qqstalker_cli`、`qqstalker_realtime` 包；保留现有 `src.*` CLI 模块一个发布周期作为兼容转发入口。
+- 将代码重组为单一 `pyproject.toml` 管理的 `qqstalker_core`、`qqstalker_cli`、`qqstalker_realtime` 包；旧的平铺 `src.*` 入口和兼容转发模块不再保留。
 - 将 SQLModel 实体、数据库连接和通用消息持久化规则移入 `qqstalker_core`，使文件导入与实时同步使用同一 PostgreSQL 表和事务语义。
 - 新增 FastAPI 服务，在启动阶段主动连接配置的 NapCat WebSocket Server。首次不可达时立即退出，并显示不含 token 的目标连接参数；首次连接成功后的断线使用指数退避自动重连。
 - 仅同步群白名单内的普通群消息，保存文本、数组消息段、群名片、@ 提及和资源元数据，不下载远程附件、不发送 OneBot action。
@@ -19,7 +19,7 @@
 ### New Capabilities
 
 - `napcat-forward-websocket-sync`: FastAPI 主动连接 NapCat OneBot 11 WebSocket Server，按白名单同步群消息与已知消息的撤回状态。
-- `multi-package-layout`: 分离共享核心、兼容 CLI 和实时服务包，同时保留旧 CLI 的过渡调用路径。
+- `multi-package-layout`: 分离共享核心、CLI 和实时服务包，并要求所有调用使用新的模块路径。
 
 ### Modified Capabilities
 

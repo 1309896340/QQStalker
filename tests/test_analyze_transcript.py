@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 import unittest
 
-from src import analyze_transcript
+from src.qqstalker_cli import analyze_transcript
 
 
 class SelectMembersTests(unittest.TestCase):

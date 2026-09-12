@@ -9,7 +9,7 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from src import analyze_transcript, export_markdown, render_html_png
+from src.qqstalker_cli import analyze_transcript, export_markdown, render_html_png
 
 
 def environment_positive_integer(name: str, default: int) -> int:
