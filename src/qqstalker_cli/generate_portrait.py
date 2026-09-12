@@ -93,6 +93,22 @@ def generate_portrait(
             ),
             top_members=top_members,
             min_message_count=min_message_count,
+            context_messages_before=analyze_transcript.nonnegative_integer_setting(
+                "LLM_CONTEXT_MESSAGES_BEFORE",
+                analyze_transcript.DEFAULT_CONTEXT_MESSAGES_BEFORE,
+            ),
+            context_messages_after=analyze_transcript.nonnegative_integer_setting(
+                "LLM_CONTEXT_MESSAGES_AFTER",
+                analyze_transcript.DEFAULT_CONTEXT_MESSAGES_AFTER,
+            ),
+            max_context_windows_per_member=analyze_transcript.positive_integer_setting(
+                "LLM_MAX_CONTEXT_WINDOWS_PER_MEMBER",
+                analyze_transcript.DEFAULT_MAX_CONTEXT_WINDOWS_PER_MEMBER,
+            ),
+            max_context_characters_per_member=analyze_transcript.positive_integer_setting(
+                "LLM_MAX_CONTEXT_CHARACTERS_PER_MEMBER",
+                analyze_transcript.DEFAULT_MAX_CONTEXT_CHARACTERS_PER_MEMBER,
+            ),
             quote_count=quote_count,
         )
         generated_at = datetime.now()

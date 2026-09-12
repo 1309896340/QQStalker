@@ -15,6 +15,8 @@ import bleach
 import httpx
 import markdown
 
+from src.qqstalker_cli import contextual_analysis
+
 PROMPT = """分析聊天记录中出现的每个群员的画像。
 
 任务目标：仅基于本批次给出的聊天记录，为成员清单中的每一位成员分别写出简洁画像；不能遗漏、合并或新增名单外的人。信息不足时明确写“证据不足”。
@@ -33,13 +35,18 @@ PROMPT = """分析聊天记录中出现的每个群员的画像。
 2. 不引用原话、不列举证据、不添加引号内的聊天片段；加粗的独立引语行应是忠实的简短转述。没有明确观点时不显示该行。
 3. 不把昵称、性别、年龄、职业、住址、健康或现实关系等敏感信息当作事实；没有直接证据时写“推测”。
 4. 不杜撰聊天记录中不存在的经历、观点或关系；避免侮辱性、诊断式或绝对化标签。
-5. 输出只包含成员画像，不要说明推理过程、任务说明或结语。
+5. 描述回应、协作、调侃或分歧时，只能依据 @、引用、点名或语义明确的连续问答；不能因消息相邻、同批出现或内容截断而推断互动。
+6. 输出只包含成员画像，不要说明推理过程、任务说明、上下文证据或结语。
 """
 DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_MAX_TOKENS = 4_096
 DEFAULT_MEMBERS_PER_REQUEST = 6
 DEFAULT_MAX_INPUT_CHARACTERS = 24_000
 DEFAULT_FEATURED_QUOTE_COUNT = 8
+DEFAULT_CONTEXT_MESSAGES_BEFORE = 3
+DEFAULT_CONTEXT_MESSAGES_AFTER = 3
+DEFAULT_MAX_CONTEXT_WINDOWS_PER_MEMBER = 12
+DEFAULT_MAX_CONTEXT_CHARACTERS_PER_MEMBER = 12_000
 EXCLUDED_MEMBER_NAMES = frozenset({"Q群管家", "系统消息"})
 MESSAGE_BLOCK_PATTERN = re.compile(
     r"(?ms)^## [^\n]+\n\n> \*\*(?P<member>.+?)\*\*\n>\n.*?(?=^## |\Z)"
@@ -138,6 +145,21 @@ def positive_integer_setting(name: str, default: int) -> int:
     return parsed
 
 
+def nonnegative_integer_setting(name: str, default: int) -> int:
+    """Read an optional non-negative integer setting from the environment."""
+
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise RuntimeError(f"{name} 必须是非负整数") from error
+    if parsed < 0:
+        raise RuntimeError(f"{name} 必须是非负整数")
+    return parsed
+
+
 def positive_integer(value: str) -> int:
     """Parse a positive CLI integer."""
 
@@ -165,11 +187,13 @@ def nonnegative_integer(value: str) -> int:
 def extract_member_messages(transcript: str) -> list[tuple[str, list[str]]]:
     """Group every exported transcript message by its displayed group card."""
 
-    members: dict[str, list[str]] = {}
-    for match in MESSAGE_BLOCK_PATTERN.finditer(transcript):
-        member = match.group("member").strip()
-        if member and member not in EXCLUDED_MEMBER_NAMES:
-            members.setdefault(member, []).append(match.group(0).strip())
+    messages = contextual_analysis.parse_messages(
+        transcript, excluded_members=EXCLUDED_MEMBER_NAMES
+    )
+    members = {
+        member: [message.raw for message in grouped]
+        for member, grouped in contextual_analysis.group_messages(messages).items()
+    }
     if not members:
         raise RuntimeError("未能从消息记录中识别成员；请使用 export_markdown.py 生成的文件")
     return list(members.items())
@@ -194,26 +218,57 @@ def select_members(
     return ranked[:top_members]
 
 
-def build_member_prompt(member_batch: tuple[tuple[str, list[str]], ...]) -> str:
+def build_member_prompt(
+    member_batch: tuple[tuple[str, list[str]], ...],
+    *,
+    contexts: dict[str, str] | None = None,
+    max_input_characters: int | None = None,
+) -> str:
     """Build one bounded, evidence-focused request for a fixed member list."""
 
     roster = "\n".join(
         f"- {member}（本批次 {len(messages)} 条消息）"
         for member, messages in member_batch
     )
-    evidence = "\n\n".join(
-        f"## 成员：{member}\n\n" + "\n\n".join(messages)
-        for member, messages in member_batch
-    )
-    return f"""{PROMPT}
+    def render_evidence(character_limit: int | None = None) -> str:
+        parts: list[str] = []
+        for member, messages in member_batch:
+            if contexts is None:
+                content = "\n\n".join(messages)
+            else:
+                content = contexts.get(member, "")
+            if character_limit is not None and len(content) > character_limit:
+                content = content[: max(0, character_limit - 10)].rstrip() + "…（内容已截断）"
+            parts.append(f"## 成员：{member}\n\n{content}")
+        return "\n\n".join(parts)
+
+    evidence = render_evidence()
+    prompt = f"""{PROMPT}
 
 本批次必须覆盖的成员清单：
 {roster}
 
-以下为本批次成员的原始消息记录：
+以下为本批次成员的代表性发言及其按时间排序的上下文。上下文只供判断，不得在最终画像中列举、引用或添加证据字段：
 
 {evidence}
 """
+    if max_input_characters is None or len(prompt) <= max_input_characters:
+        return prompt
+    fixed_size = len(prompt) - len(evidence)
+    if fixed_size >= max_input_characters:
+        raise RuntimeError("LLM_MAX_INPUT_CHARACTERS 小于成员画像请求的固定开销")
+    per_member_limit = max(1, (max_input_characters - fixed_size) // len(member_batch))
+    evidence = render_evidence(per_member_limit)
+    prompt = f"""{PROMPT}
+
+本批次必须覆盖的成员清单：
+{roster}
+
+以下为本批次成员的代表性发言及其按时间排序的上下文。上下文只供判断，不得在最终画像中列举、引用或添加证据字段：
+
+{evidence}
+"""
+    return prompt[:max_input_characters]
 
 
 def build_featured_quotes_prompt(transcript: str, *, quote_count: int) -> str:
@@ -518,11 +573,15 @@ def analyze_member_batch(
     max_tokens: int,
     timeout_seconds: float,
     skipped_members: list[str] | None = None,
+    contexts: dict[str, str] | None = None,
+    max_input_characters: int | None = None,
 ) -> str:
     """Analyze one batch, retry incomplete members, and skip unrecoverable ones."""
 
     analysis, finish_reason = request_portraits(
-        build_member_prompt(member_batch),
+        build_member_prompt(
+            member_batch, contexts=contexts, max_input_characters=max_input_characters
+        ),
         base_url=base_url,
         model=model,
         api_key=api_key,
@@ -544,7 +603,11 @@ def analyze_member_batch(
             continue
         print(f"正在补充群员画像：{member}", flush=True)
         recovered, recovered_reason = request_portraits(
-            build_member_prompt(((member, messages),)),
+            build_member_prompt(
+                ((member, messages),),
+                contexts={member: contexts[member]} if contexts and member in contexts else None,
+                max_input_characters=max_input_characters,
+            ),
             base_url=base_url,
             model=model,
             api_key=api_key,
@@ -627,10 +690,21 @@ def analyze_all_members(
     max_input_characters: int,
     top_members: int | None,
     min_message_count: int,
+    context_messages_before: int = DEFAULT_CONTEXT_MESSAGES_BEFORE,
+    context_messages_after: int = DEFAULT_CONTEXT_MESSAGES_AFTER,
+    max_context_windows_per_member: int = DEFAULT_MAX_CONTEXT_WINDOWS_PER_MEMBER,
+    max_context_characters_per_member: int = DEFAULT_MAX_CONTEXT_CHARACTERS_PER_MEMBER,
     quote_count: int = DEFAULT_FEATURED_QUOTE_COUNT,
 ) -> str:
     """Produce a complete portrait section for every member in the transcript."""
 
+    if context_messages_before < 0 or context_messages_after < 0:
+        raise RuntimeError("上下文消息条数必须是非负整数")
+    if context_messages_before == 0 and context_messages_after == 0:
+        raise RuntimeError("上下文前后消息条数不能同时为 0")
+    chronological_messages = contextual_analysis.parse_messages(
+        transcript, excluded_members=EXCLUDED_MEMBER_NAMES
+    )
     all_members = extract_member_messages(transcript)
     members = select_members(
         all_members,
@@ -655,6 +729,14 @@ def analyze_all_members(
             flush=True,
         )
         print(f"本批次群员：{format_member_batch_names(member_batch)}", flush=True)
+        contexts = contextual_analysis.build_member_contexts(
+            chronological_messages,
+            tuple(member for member, _ in member_batch),
+            before=context_messages_before,
+            after=context_messages_after,
+            maximum_windows=max_context_windows_per_member,
+            maximum_characters=max_context_characters_per_member,
+        )
         batch_analysis = analyze_member_batch(
             member_batch,
             base_url=base_url,
@@ -663,6 +745,8 @@ def analyze_all_members(
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
             skipped_members=skipped_members,
+            contexts=contexts,
+            max_input_characters=max_input_characters,
         )
         if batch_analysis:
             portraits.append(
@@ -1085,6 +1169,20 @@ def main() -> None:
             ),
             top_members=args.top_members,
             min_message_count=args.min_message_count,
+            context_messages_before=nonnegative_integer_setting(
+                "LLM_CONTEXT_MESSAGES_BEFORE", DEFAULT_CONTEXT_MESSAGES_BEFORE
+            ),
+            context_messages_after=nonnegative_integer_setting(
+                "LLM_CONTEXT_MESSAGES_AFTER", DEFAULT_CONTEXT_MESSAGES_AFTER
+            ),
+            max_context_windows_per_member=positive_integer_setting(
+                "LLM_MAX_CONTEXT_WINDOWS_PER_MEMBER",
+                DEFAULT_MAX_CONTEXT_WINDOWS_PER_MEMBER,
+            ),
+            max_context_characters_per_member=positive_integer_setting(
+                "LLM_MAX_CONTEXT_CHARACTERS_PER_MEMBER",
+                DEFAULT_MAX_CONTEXT_CHARACTERS_PER_MEMBER,
+            ),
             quote_count=args.quote_count,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)

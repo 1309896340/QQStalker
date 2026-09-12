@@ -7,7 +7,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from src.qqstalker_cli import analyze_transcript
+from src.qqstalker_cli import analyze_transcript, contextual_analysis
 
 
 class SelectMembersTests(unittest.TestCase):
@@ -397,6 +397,95 @@ class LlmErrorTests(unittest.TestCase):
         )
 
         self.assertEqual(message, "大模型请求失败（HTTP 401）：invalid credentials")
+
+
+class ContextualAnalysisTests(unittest.TestCase):
+    """The contextual prompt builder must remain ordered, bounded, and conservative."""
+
+    TRANSCRIPT = """## 2026-09-11 09:00:00 · 测试群
+
+> **乙**
+>
+> 先提出一个问题
+
+## 2026-09-11 09:01:00 · 测试群
+
+> **甲**
+>
+> @乙 我来回答？
+
+## 2026-09-11 09:02:00 · 测试群
+
+> **Q群管家**
+>
+> 系统通知
+
+## 2026-09-11 09:03:00 · 测试群
+
+> **丙**
+>
+> 这是后续补充
+
+## 2026-09-11 09:04:00 · 测试群
+
+> **甲**
+>
+> [图片]
+"""
+
+    def test_parses_human_messages_in_order_and_excludes_service_senders(self) -> None:
+        messages = contextual_analysis.parse_messages(
+            self.TRANSCRIPT, excluded_members=analyze_transcript.EXCLUDED_MEMBER_NAMES
+        )
+
+        self.assertEqual([message.member for message in messages], ["乙", "甲", "丙", "甲"])
+        self.assertEqual([message.index for message in messages], [0, 1, 2, 3])
+        self.assertEqual(messages[1].content, "@乙 我来回答？")
+
+    def test_prioritizes_direct_signal_and_merges_windows_without_duplicates(self) -> None:
+        messages = contextual_analysis.parse_messages(
+            self.TRANSCRIPT, excluded_members=analyze_transcript.EXCLUDED_MEMBER_NAMES
+        )
+        centers = contextual_analysis.choose_representatives(
+            tuple(message for message in messages if message.member == "甲"), maximum=2
+        )
+        window = contextual_analysis.merged_window_messages(
+            messages, centers, before=1, after=1
+        )
+
+        self.assertEqual([message.index for message in centers], [1])
+        self.assertEqual([message.index for message in window], [0, 1, 2])
+
+    def test_serialization_marks_and_truncates_context(self) -> None:
+        messages = contextual_analysis.parse_messages(
+            self.TRANSCRIPT, excluded_members=analyze_transcript.EXCLUDED_MEMBER_NAMES
+        )
+        centers = (messages[1],)
+        rendered = contextual_analysis.serialize_context(
+            messages[:3], centers, maximum_characters=100
+        )
+
+        self.assertIn("[2 | 2026-09-11 09:01:00 | 甲]", rendered)
+        self.assertIn("内容已截断", rendered)
+        self.assertLessEqual(len(rendered), 100)
+
+    def test_allows_one_sided_context_but_rejects_two_zero_sides(self) -> None:
+        self.assertEqual(analyze_transcript.nonnegative_integer_setting("MISSING", 0), 0)
+        with self.assertRaisesRegex(RuntimeError, "不能同时为 0"):
+            analyze_transcript.analyze_all_members(
+                self.TRANSCRIPT,
+                base_url="https://example.test",
+                model="test-model",
+                api_key="test-key",
+                max_tokens=10,
+                timeout_seconds=1,
+                members_per_request=2,
+                max_input_characters=10_000,
+                top_members=1,
+                min_message_count=0,
+                context_messages_before=0,
+                context_messages_after=0,
+            )
 
 
 if __name__ == "__main__":
