@@ -149,6 +149,24 @@ class ArgumentParserTests(unittest.TestCase):
             ],
         )
 
+class ResourceWaitTests(unittest.TestCase):
+    def test_waits_for_discussion_chart_completion_state(self) -> None:
+        class Page:
+            def __init__(self) -> None:
+                self.wait_calls: list[tuple[str, int]] = []
+
+            def evaluate(self, _script: str) -> None:
+                return None
+
+            def wait_for_function(self, script: str, *, timeout: int) -> None:
+                self.wait_calls.append((script, timeout))
+
+        page = Page()
+        render_html_png.wait_for_document_resources(page)  # type: ignore[arg-type]
+
+        self.assertEqual(page.wait_calls[0][1], 10_000)
+        self.assertIn("__qqstalkerDiscussionChartState", page.wait_calls[0][0])
+
 
 if __name__ == "__main__":
     unittest.main()

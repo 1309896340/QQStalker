@@ -181,7 +181,7 @@ def set_png_dpi(image_path: Path, dpi: int) -> None:
 
 
 def wait_for_document_resources(page: Page) -> None:
-    """Wait for fonts and local images so the screenshot is complete."""
+    """Wait for fonts, local images, and the optional discussion chart."""
 
     page.evaluate(
         """async () => {
@@ -199,6 +199,26 @@ def wait_for_document_resources(page: Page) -> None:
             );
         }"""
     )
+    try:
+        page.wait_for_function(
+            """() => {
+                const chart = document.querySelector('.discussion-chart');
+                if (!chart) return true;
+                return ['ready', 'failed', 'not-needed'].includes(
+                    window.__qqstalkerDiscussionChartState,
+                );
+            }""",
+            timeout=10_000,
+        )
+    except PlaywrightError:
+        # Keep the Markdown table fallback visible if a CDN is unavailable.
+        page.evaluate(
+            """() => {
+                window.__qqstalkerDiscussionChartState = 'failed';
+                const chart = document.querySelector('.discussion-chart');
+                if (chart) chart.hidden = true;
+            }"""
+        )
 
 
 def document_dimensions(page: Page) -> tuple[int, int]:

@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
+import sys
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
 from pathlib import Path
@@ -15,7 +22,7 @@ import bleach
 import httpx
 import markdown
 
-from src.qqstalker_cli import contextual_analysis
+from src.qqstalker_cli import contextual_analysis, discussion_analysis
 
 PROMPT = """分析聊天记录中出现的每个群员的画像。
 
@@ -39,15 +46,41 @@ PROMPT = """分析聊天记录中出现的每个群员的画像。
 6. 输出只包含成员画像，不要说明推理过程、任务说明、上下文证据或结语。
 """
 DEFAULT_TIMEOUT_SECONDS = 300.0
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_DELAY_SECONDS = 2.0
+DEFAULT_PROGRESS_INTERVAL_SECONDS = 15.0
+REFRESH_MODE_INTERVAL_SECONDS = 1.0
 DEFAULT_MAX_TOKENS = 4_096
 DEFAULT_MEMBERS_PER_REQUEST = 6
 DEFAULT_MAX_INPUT_CHARACTERS = 24_000
 DEFAULT_FEATURED_QUOTE_COUNT = 8
+DEFAULT_MAX_DISCUSSION_TOPICS = 5
+DEFAULT_DISCUSSION_CONCURRENCY = 4
 DEFAULT_CONTEXT_MESSAGES_BEFORE = 3
 DEFAULT_CONTEXT_MESSAGES_AFTER = 3
 DEFAULT_MAX_CONTEXT_WINDOWS_PER_MEMBER = 12
 DEFAULT_MAX_CONTEXT_CHARACTERS_PER_MEMBER = 12_000
 EXCLUDED_MEMBER_NAMES = frozenset({"Q群管家", "系统消息"})
+
+
+@dataclass(frozen=True)
+class AnalysisReport:
+    """Report Markdown together with trusted structured discussion-chart data."""
+
+    markdown: str
+    discussion: discussion_analysis.DiscussionReport | None = None
+
+
+def unpack_analysis_report(
+    analysis: AnalysisReport | str,
+) -> tuple[str, discussion_analysis.DiscussionReport | None]:
+    """Accept the legacy Markdown result while callers migrate to AnalysisReport."""
+
+    if isinstance(analysis, AnalysisReport):
+        return analysis.markdown, analysis.discussion
+    return analysis, None
+
+
 MESSAGE_BLOCK_PATTERN = re.compile(
     r"(?ms)^## [^\n]+\n\n> \*\*(?P<member>.+?)\*\*\n>\n.*?(?=^## |\Z)"
 )
@@ -145,6 +178,21 @@ def positive_integer_setting(name: str, default: int) -> int:
     return parsed
 
 
+def positive_float_setting(name: str, default: float) -> float:
+    """Read an optional positive floating-point setting from the environment."""
+
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise RuntimeError(f"{name} 必须是正数") from error
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise RuntimeError(f"{name} 必须是正数")
+    return parsed
+
+
 def nonnegative_integer_setting(name: str, default: int) -> int:
     """Read an optional non-negative integer setting from the environment."""
 
@@ -158,6 +206,36 @@ def nonnegative_integer_setting(name: str, default: int) -> int:
     if parsed < 0:
         raise RuntimeError(f"{name} 必须是非负整数")
     return parsed
+
+
+BOOLEAN_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+BOOLEAN_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def boolean_setting(name: str, default: bool) -> bool:
+    """Read an optional boolean setting from the environment."""
+
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in BOOLEAN_TRUE_VALUES:
+        return True
+    if normalized in BOOLEAN_FALSE_VALUES:
+        return False
+    raise RuntimeError(f"{name} 必须是布尔值（true/false/1/0/yes/no/on/off）")
+
+
+def thinking_control_setting() -> dict[str, str] | None:
+    """Read the optional LLM_THINKING toggle into a request payload field."""
+
+    value = os.getenv("LLM_THINKING")
+    if value is None or not value.strip():
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"enabled", "disabled"}:
+        return {"type": normalized}
+    raise RuntimeError("LLM_THINKING 必须是 enabled 或 disabled")
 
 
 def positive_integer(value: str) -> int:
@@ -503,6 +581,313 @@ def format_llm_http_error(*, base_url: str, status_code: int, detail: str) -> st
     return f"大模型请求失败（HTTP {status_code}）：{detail}"
 
 
+def is_retryable_llm_status(status_code: int) -> bool:
+    """Return whether an HTTP response is likely to succeed after a short delay."""
+
+    return status_code in {408, 409, 425, 429} or 500 <= status_code <= 599
+
+
+def retry_delay_seconds(*, retry_number: int, initial_delay_seconds: float) -> float:
+    """Return an exponential backoff delay for a one-based retry number."""
+
+    return initial_delay_seconds * (2 ** (retry_number - 1))
+
+
+def wait_before_llm_retry(
+    error: Exception,
+    *,
+    retry_number: int,
+    max_retries: int,
+    initial_delay_seconds: float,
+    detail: str = "",
+) -> None:
+    """Report and wait before retrying a transient LLM request failure."""
+
+    delay_seconds = retry_delay_seconds(
+        retry_number=retry_number,
+        initial_delay_seconds=initial_delay_seconds,
+    )
+    print(
+        "大模型请求暂时失败"
+        f"（{error}{detail}）；将在 {delay_seconds:g} 秒后自动重试"
+        f"（第 {retry_number + 1}/{max_retries + 1} 次尝试）。",
+        flush=True,
+    )
+    time.sleep(delay_seconds)
+
+
+def retries_exhausted_suffix(max_retries: int) -> str:
+    """Describe retry exhaustion without changing the original error category."""
+
+    return f"（已自动重试 {max_retries} 次后仍失败）" if max_retries else ""
+
+
+def format_elapsed_seconds(seconds: float) -> str:
+    """Format a duration in compact Chinese units without fractional seconds."""
+
+    total_seconds = max(0, int(round(seconds)))
+    minutes, remainder = divmod(total_seconds, 60)
+    if minutes == 0:
+        return f"{total_seconds} 秒"
+    if remainder == 0:
+        return f"{minutes} 分钟"
+    return f"{minutes} 分 {remainder} 秒"
+
+
+@contextmanager
+def llm_wait_heartbeat(
+    stage_label: str | None,
+    *,
+    interval_seconds: float,
+    reporter: LiveProgressLine | None = None,
+) -> Iterator[None]:
+    """Periodically report elapsed wait time while one blocking LLM request runs."""
+
+    if not stage_label or interval_seconds <= 0:
+        yield
+        return
+    stop = threading.Event()
+    started = time.monotonic()
+
+    def report_wait() -> None:
+        while not stop.wait(interval_seconds):
+            text = (
+                f"{stage_label}：大模型仍在生成，"
+                f"已等待 {format_elapsed_seconds(time.monotonic() - started)}…"
+            )
+            if reporter is None:
+                print(text, flush=True)
+            else:
+                reporter.refresh(text)
+
+    watcher = threading.Thread(target=report_wait, daemon=True)
+    watcher.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        watcher.join()
+
+
+_windows_virtual_terminal_enabled = False
+
+
+def _enable_windows_virtual_terminal() -> None:
+    """Enable ANSI escape processing on Windows consoles (no-op elsewhere)."""
+
+    global _windows_virtual_terminal_enabled
+    if os.name != "nt" or _windows_virtual_terminal_enabled:
+        return
+    os.system("")  # Empty command enables VT processing in the classic console host.
+    _windows_virtual_terminal_enabled = True
+
+
+def stdout_supports_refresh() -> bool:
+    """Whether the current stdout can redraw a progress line in place."""
+
+    try:
+        return bool(sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+class LiveProgressLine:
+    """One progress line: refreshes in place on terminals, accumulates otherwise."""
+
+    def __init__(self) -> None:
+        self.refresh_mode = stdout_supports_refresh()
+        self._lock = threading.Lock()
+        self._active = False
+
+    def refresh(self, text: str) -> None:
+        """Replace the line content, printing one line per frame when redirected."""
+
+        with self._lock:
+            if self.refresh_mode:
+                _enable_windows_virtual_terminal()
+                print(f"\r\x1b[2K{text}", end="", flush=True)
+                self._active = True
+            else:
+                print(text, flush=True)
+
+    def end(self) -> None:
+        """Finish the live line so subsequent prints start on a fresh line."""
+
+        with self._lock:
+            if self._active:
+                print(flush=True)
+                self._active = False
+
+
+@dataclass
+class SseStreamAccumulator:
+    """Accumulate streaming chat-completion increments into the final text."""
+
+    content_parts: list[str] = field(default_factory=list)
+    reasoning_parts: list[str] = field(default_factory=list)
+    finish_reason: str | None = None
+
+    @property
+    def text(self) -> str:
+        """Prefer content increments, falling back to reasoning increments."""
+
+        content = "".join(self.content_parts).strip()
+        if content:
+            return content
+        return "".join(self.reasoning_parts).strip()
+
+    @property
+    def received_characters(self) -> int:
+        return sum(len(part) for part in self.content_parts) + sum(
+            len(part) for part in self.reasoning_parts
+        )
+
+    def feed_line(self, line: str) -> bool:
+        """Consume one SSE line; return True once the stream is complete."""
+
+        stripped = line.strip()
+        if not stripped or stripped.startswith(":") or not stripped.startswith("data:"):
+            return False
+        payload = stripped[len("data:") :].strip()
+        if payload == "[DONE]":
+            return True
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(chunk, dict):
+            return False
+        choices = chunk.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            first_choice = choices[0]
+            delta = first_choice.get("delta")
+            if isinstance(delta, dict):
+                for key in ("content", "reasoning_content"):
+                    value = delta.get(key)
+                    if isinstance(value, str) and value:
+                        if key == "content":
+                            self.content_parts.append(value)
+                        else:
+                            self.reasoning_parts.append(value)
+            legacy_text = first_choice.get("text")
+            if isinstance(legacy_text, str) and legacy_text:
+                self.content_parts.append(legacy_text)
+            candidate = first_choice.get("finish_reason")
+            if isinstance(candidate, str):
+                self.finish_reason = candidate
+        return False
+
+
+def stream_chat_completion(
+    client: httpx.Client,
+    endpoint: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    *,
+    accumulator: SseStreamAccumulator,
+    stage_label: str | None,
+    progress_interval_seconds: float,
+    reporter: LiveProgressLine | None = None,
+) -> tuple[str, str | None]:
+    """Run one streaming chat completion, reporting data-driven progress."""
+
+    frame_started = time.monotonic()
+    last_progress = frame_started
+    with client.stream("POST", endpoint, headers=headers, json=payload) as response:
+        response.raise_for_status()
+        for line in response.iter_lines():
+            if accumulator.feed_line(line):
+                break
+            if (
+                stage_label
+                and reporter is not None
+                and progress_interval_seconds > 0
+                and accumulator.received_characters
+            ):
+                now = time.monotonic()
+                if now - last_progress >= progress_interval_seconds:
+                    reporter.refresh(
+                        f"{stage_label}：大模型正在生成，"
+                        f"已接收 {accumulator.received_characters:,} 字"
+                        f"（已等待 {format_elapsed_seconds(now - frame_started)}）…"
+                    )
+                    last_progress = now
+    return accumulator.text, accumulator.finish_reason
+
+
+TRACE_DIRECTORY = Path(__file__).resolve().parents[2] / "temp"
+TRACE_PROMPT_PREVIEW_CHARACTERS = 100
+_TRACE_ALLOCATION_LOCK = threading.Lock()
+_ALLOCATED_TRACE_STEMS: set[str] = set()
+
+
+def _trace_header(stage_label: str | None, model: str) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stage = stage_label or "未标注"
+    return f"- 时间：{now}\n- 阶段：{stage}\n- 模型：{model}"
+
+
+def write_llm_request_trace(
+    *, stage_label: str | None, model: str, prompt: str
+) -> Path | None:
+    """Persist one bounded request preview and reserve its paired response path."""
+
+    preview = prompt[:TRACE_PROMPT_PREVIEW_CHARACTERS]
+    if len(prompt) > TRACE_PROMPT_PREVIEW_CHARACTERS:
+        preview += "..."
+    try:
+        with _TRACE_ALLOCATION_LOCK:
+            directory = TRACE_DIRECTORY
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            stem = stamp
+            index = 1
+            while stem in _ALLOCATED_TRACE_STEMS or any(
+                (directory / f"{stem}_{kind}.md").exists()
+                for kind in ("request", "response")
+            ):
+                index += 1
+                stem = f"{stamp}_{index}"
+            _ALLOCATED_TRACE_STEMS.add(stem)
+            directory.mkdir(parents=True, exist_ok=True)
+            response_path = directory / f"{stem}_response.md"
+            (directory / f"{stem}_request.md").write_text(
+                "# LLM 请求记录\n\n"
+                f"{_trace_header(stage_label, model)}\n"
+                f"- 输入长度：{len(prompt):,} 字\n\n"
+                "## 请求消息（最多前 100 字）\n\n"
+                f"{preview}\n",
+                encoding="utf-8",
+            )
+        return response_path
+    except OSError as error:
+        print(f"警告：无法写入大模型请求记录，本次跳过：{error}", flush=True)
+        return None
+
+
+def write_llm_response_trace(
+    response_path: Path | None,
+    *,
+    stage_label: str | None,
+    model: str,
+    content: str,
+) -> None:
+    """Persist one model response (thinking excluded) beside its request record."""
+
+    if response_path is None:
+        return
+    try:
+        response_path.write_text(
+            "# LLM 响应记录\n\n"
+            f"{_trace_header(stage_label, model)}\n"
+            f"- 输出长度：{len(content):,} 字\n\n"
+            "## 响应内容（不含思考过程）\n\n"
+            f"{content}\n",
+            encoding="utf-8",
+        )
+    except OSError as error:
+        print(f"警告：无法写入大模型响应记录，本次跳过：{error}", flush=True)
+
+
 def request_portraits(
     prompt: str,
     *,
@@ -511,57 +896,167 @@ def request_portraits(
     api_key: str,
     max_tokens: int,
     timeout_seconds: float,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
+    stage_label: str | None = None,
+    progress_interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
+    attempt_counter: list[int] | None = None,
 ) -> tuple[str, str | None]:
-    """Call an OpenAI-compatible chat-completions endpoint and return its text."""
+    """Call an OpenAI-compatible endpoint with bounded retries for transient failures."""
 
+    if max_retries < 0:
+        raise ValueError("max_retries 不能小于 0")
+    if not math.isfinite(retry_delay_seconds) or retry_delay_seconds <= 0:
+        raise ValueError("retry_delay_seconds 必须是正数")
+    if (
+        not math.isfinite(progress_interval_seconds)
+        or progress_interval_seconds < 0
+    ):
+        raise ValueError("progress_interval_seconds 必须是非负数")
+
+    use_stream = boolean_setting("LLM_STREAM", True)
     endpoint = f"{base_url.rstrip('/')}/chat/completions"
-    payload = {
+    headers = {"Authorization": f"Bearer {api_key}"}
+    payload: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "max_tokens": max_tokens,
     }
-    try:
-        with httpx.Client(timeout=timeout_seconds) as client:
-            response = client.post(
-                endpoint,
-                headers={"Authorization": f"Bearer {api_key}"},
-                json=payload,
-            )
-            response.raise_for_status()
-    except httpx.HTTPStatusError as error:
-        detail = error.response.text[:1_000]
-        raise RuntimeError(
-            format_llm_http_error(
-                base_url=base_url,
-                status_code=error.response.status_code,
-                detail=detail,
-            )
-        ) from error
-    except httpx.HTTPError as error:
-        raise RuntimeError(f"无法连接大模型服务：{error}") from error
+    thinking = thinking_control_setting()
+    if thinking is not None:
+        payload["thinking"] = thinking
+    if stage_label:
+        mode = "流式" if use_stream else "非流式"
+        print(
+            f"{stage_label}：正在请求大模型（{mode}，输入 {len(prompt):,} 字，"
+            f"最长等待 {format_elapsed_seconds(timeout_seconds)}）…",
+            flush=True,
+        )
+    response_trace_path = write_llm_request_trace(
+        stage_label=stage_label, model=model, prompt=prompt
+    )
+    request_started = time.monotonic()
+    progress_reporter = LiveProgressLine() if stage_label else None
+    effective_interval = (
+        REFRESH_MODE_INTERVAL_SECONDS
+        if progress_reporter is not None and progress_reporter.refresh_mode
+        else progress_interval_seconds
+    )
+    content: str | None = None
+    finish_reason: str | None = None
+    response: httpx.Response | None = None
+    attempts_used = 0
+    with httpx.Client(timeout=timeout_seconds) as client:
+        for attempt in range(max_retries + 1):
+            accumulator = SseStreamAccumulator()
+            try:
+                if use_stream:
+                    content, finish_reason = stream_chat_completion(
+                        client,
+                        endpoint,
+                        headers,
+                        {**payload, "stream": True},
+                        accumulator=accumulator,
+                        stage_label=stage_label,
+                        progress_interval_seconds=effective_interval,
+                        reporter=progress_reporter,
+                    )
+                else:
+                    with llm_wait_heartbeat(
+                        stage_label,
+                        interval_seconds=effective_interval,
+                        reporter=progress_reporter,
+                    ):
+                        response = client.post(
+                            endpoint,
+                            headers=headers,
+                            json=payload,
+                        )
+                    response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                if progress_reporter is not None:
+                    progress_reporter.end()
+                status_code = error.response.status_code
+                if not is_retryable_llm_status(status_code) or attempt == max_retries:
+                    detail = error.response.text[:1_000]
+                    message = format_llm_http_error(
+                        base_url=base_url,
+                        status_code=status_code,
+                        detail=detail,
+                    )
+                    raise RuntimeError(message + retries_exhausted_suffix(max_retries)) from error
+                wait_before_llm_retry(
+                    error,
+                    retry_number=attempt + 1,
+                    max_retries=max_retries,
+                    initial_delay_seconds=retry_delay_seconds,
+                )
+            except httpx.TransportError as error:
+                if progress_reporter is not None:
+                    progress_reporter.end()
+                partial_detail = (
+                    f"；流式已接收 {accumulator.received_characters:,} 字后中断"
+                    if use_stream and accumulator.received_characters
+                    else ""
+                )
+                if attempt == max_retries:
+                    raise RuntimeError(
+                        f"无法连接大模型服务：{error}{partial_detail}"
+                        f"{retries_exhausted_suffix(max_retries)}"
+                    ) from error
+                wait_before_llm_retry(
+                    error,
+                    retry_number=attempt + 1,
+                    max_retries=max_retries,
+                    initial_delay_seconds=retry_delay_seconds,
+                    detail=partial_detail,
+                )
+            else:
+                attempts_used = attempt + 1
+                break
 
-    response_data: dict[str, Any]
-    try:
-        response_data = response.json()
-    except json.JSONDecodeError as error:
-        raise RuntimeError("大模型响应不是 JSON 格式") from error
-    if not isinstance(response_data, dict):
-        raise RuntimeError("大模型响应根对象不是 JSON 对象")
+    if progress_reporter is not None:
+        progress_reporter.end()
+    if use_stream:
+        if not content:
+            raise RuntimeError("大模型响应中没有可用的文本内容；流式响应未产生增量文本")
+    else:
+        assert response is not None
+        response_data: dict[str, Any]
+        try:
+            response_data = response.json()
+        except json.JSONDecodeError as error:
+            raise RuntimeError("大模型响应不是 JSON 格式") from error
+        if not isinstance(response_data, dict):
+            raise RuntimeError("大模型响应根对象不是 JSON 对象")
 
-    content = extract_response_text(response_data)
-    if content:
+        content = extract_response_text(response_data)
+        if not content:
+            raise RuntimeError(
+                "大模型响应中没有可用的文本内容；"
+                f"响应结构：{response_shape_summary(response_data)}"
+            )
         choices = response_data.get("choices")
-        finish_reason: str | None = None
+        finish_reason = None
         if isinstance(choices, list) and choices and isinstance(choices[0], dict):
             candidate = choices[0].get("finish_reason")
             if isinstance(candidate, str):
                 finish_reason = candidate
-        return content, finish_reason
-    raise RuntimeError(
-        "大模型响应中没有可用的文本内容；"
-        f"响应结构：{response_shape_summary(response_data)}"
+
+    if stage_label:
+        elapsed_seconds = time.monotonic() - request_started
+        print(
+            f"{stage_label}：大模型响应完成"
+            f"（耗时 {format_elapsed_seconds(elapsed_seconds)}，输出 {len(content):,} 字）",
+            flush=True,
+        )
+    if attempt_counter is not None:
+        attempt_counter.append(attempts_used)
+    write_llm_response_trace(
+        response_trace_path, stage_label=stage_label, model=model, content=content
     )
+    return content, finish_reason
 
 
 def analyze_member_batch(
@@ -572,9 +1067,12 @@ def analyze_member_batch(
     api_key: str,
     max_tokens: int,
     timeout_seconds: float,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
     skipped_members: list[str] | None = None,
     contexts: dict[str, str] | None = None,
     max_input_characters: int | None = None,
+    stage_label: str | None = None,
 ) -> str:
     """Analyze one batch, retry incomplete members, and skip unrecoverable ones."""
 
@@ -587,6 +1085,9 @@ def analyze_member_batch(
         api_key=api_key,
         max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+        retry_delay_seconds=retry_delay_seconds,
+        stage_label=stage_label,
     )
     missing_members = [
         member for member, _ in member_batch if not has_member_heading(analysis, member)
@@ -601,7 +1102,11 @@ def analyze_member_batch(
     for member, messages in member_batch:
         if member not in missing_members:
             continue
-        print(f"正在补充群员画像：{member}", flush=True)
+        recovery_label = (
+            f"{stage_label}：补充画像（{member}）"
+            if stage_label
+            else f"补充画像（{member}）"
+        )
         recovered, recovered_reason = request_portraits(
             build_member_prompt(
                 ((member, messages),),
@@ -613,6 +1118,9 @@ def analyze_member_batch(
             api_key=api_key,
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            retry_delay_seconds=retry_delay_seconds,
+            stage_label=recovery_label,
         )
         if recovered_reason == "length" or not has_member_heading(recovered, member):
             print(
@@ -638,6 +1146,8 @@ def analyze_featured_quotes(
     api_key: str,
     max_tokens: int,
     timeout_seconds: float,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
 ) -> str:
     """Select the strongest humorous or provocative quotes from the full transcript."""
 
@@ -648,6 +1158,9 @@ def analyze_featured_quotes(
         api_key=api_key,
         max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+        retry_delay_seconds=retry_delay_seconds,
+        stage_label="语录精选",
     )
     if finish_reason == "length":
         raise RuntimeError("精选语录输出被截断；请提高 LLM_MAX_TOKENS 后重试")
@@ -662,6 +1175,8 @@ def analyze_group_overview(
     api_key: str,
     max_tokens: int,
     timeout_seconds: float,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
 ) -> str:
     """Generate the interpretive portion of the report overview."""
 
@@ -672,6 +1187,9 @@ def analyze_group_overview(
         api_key=api_key,
         max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+        retry_delay_seconds=retry_delay_seconds,
+        stage_label="群像速览",
     )
     if finish_reason == "length":
         raise RuntimeError("群像速览输出被截断；请提高 LLM_MAX_TOKENS 后重试")
@@ -695,7 +1213,11 @@ def analyze_all_members(
     max_context_windows_per_member: int = DEFAULT_MAX_CONTEXT_WINDOWS_PER_MEMBER,
     max_context_characters_per_member: int = DEFAULT_MAX_CONTEXT_CHARACTERS_PER_MEMBER,
     quote_count: int = DEFAULT_FEATURED_QUOTE_COUNT,
-) -> str:
+    max_discussion_topics: int = DEFAULT_MAX_DISCUSSION_TOPICS,
+    discussion_concurrency: int = DEFAULT_DISCUSSION_CONCURRENCY,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
+) -> AnalysisReport:
     """Produce a complete portrait section for every member in the transcript."""
 
     if context_messages_before < 0 or context_messages_after < 0:
@@ -719,6 +1241,11 @@ def analyze_all_members(
         max_input_characters=max_input_characters,
     )
     total_message_count = sum(len(messages) for _, messages in all_members)
+    print(
+        f"符合条件的群员 {len(members)} 位（共 {total_message_count:,} 条消息），"
+        f"将分为 {len(member_batches)} 个批次请求大模型",
+        flush=True,
+    )
     portraits: list[str] = []
     skipped_members: list[str] = []
     for index, member_batch in enumerate(member_batches, 1):
@@ -737,6 +1264,11 @@ def analyze_all_members(
             maximum_windows=max_context_windows_per_member,
             maximum_characters=max_context_characters_per_member,
         )
+        context_characters = sum(len(text) for text in contexts.values())
+        print(
+            f"已构建 {len(contexts)} 位成员的对话上下文（共 {context_characters:,} 字）",
+            flush=True,
+        )
         batch_analysis = analyze_member_batch(
             member_batch,
             base_url=base_url,
@@ -744,9 +1276,12 @@ def analyze_all_members(
             api_key=api_key,
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            retry_delay_seconds=retry_delay_seconds,
             skipped_members=skipped_members,
             contexts=contexts,
             max_input_characters=max_input_characters,
+            stage_label=f"画像批次 {index}/{len(member_batches)}",
         )
         if batch_analysis:
             portraits.append(
@@ -771,7 +1306,51 @@ def analyze_all_members(
         api_key=api_key,
         max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+        retry_delay_seconds=retry_delay_seconds,
     )
+    discussion: discussion_analysis.DiscussionReport | None = None
+    discussion_markdown: str | None = None
+    print(
+        "正在生成讨论纪要：分段识别议题 → 归并重复主题 → 逐题撰写纪要"
+        f"（期间将发起多次大模型请求，独立请求最多 {discussion_concurrency} 个并发）",
+        flush=True,
+    )
+    try:
+        discussion_request_count = 0
+        discussion_request_lock = threading.Lock()
+
+        def request_discussion(prompt: str) -> str:
+            nonlocal discussion_request_count
+            with discussion_request_lock:
+                discussion_request_count += 1
+                stage_label = f"讨论纪要（第 {discussion_request_count} 次请求）"
+            response, finish_reason = request_portraits(
+                prompt,
+                base_url=base_url,
+                model=model,
+                api_key=api_key,
+                max_tokens=max_tokens,
+                timeout_seconds=timeout_seconds,
+                max_retries=max_retries,
+                retry_delay_seconds=retry_delay_seconds,
+                stage_label=stage_label,
+            )
+            if finish_reason == "length":
+                raise RuntimeError("讨论纪要输出被截断；请提高 LLM_MAX_TOKENS 后重试")
+            return response
+
+        discussion = discussion_analysis.analyze_discussion_minutes(
+            chronological_messages,
+            maximum_topics=max_discussion_topics,
+            maximum_input_characters=max_input_characters,
+            request_text=request_discussion,
+            maximum_workers=discussion_concurrency,
+        )
+        discussion_markdown = discussion.to_markdown()
+    except RuntimeError as error:
+        print(f"警告：讨论纪要生成失败，已继续生成主报告：{error}", flush=True)
+        discussion_markdown = "## 讨论纪要\n\n讨论纪要暂不可用。"
     featured_quotes = analyze_featured_quotes(
         transcript,
         quote_count=quote_count,
@@ -780,15 +1359,21 @@ def analyze_all_members(
         api_key=api_key,
         max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+        retry_delay_seconds=retry_delay_seconds,
     )
-    return build_analysis_document(
+    return AnalysisReport(
+        build_analysis_document(
         member_count=len(analyzed_members),
         portraits=portrait_sections,
         overview=overview,
         top_member=analyzed_members[0],
         total_message_count=total_message_count,
         primary_activity_period=build_group_activity_period(analyzed_members),
+        discussion_minutes=discussion_markdown,
         featured_quotes=featured_quotes,
+        ),
+        discussion,
     )
 
 
@@ -800,6 +1385,7 @@ def build_analysis_document(
     top_member: tuple[str, list[str]] | None = None,
     total_message_count: int | None = None,
     primary_activity_period: str | None = None,
+    discussion_minutes: str | None = None,
     featured_quotes: str | None = None,
 ) -> str:
     """Assemble portrait Markdown without exposing internal request batches."""
@@ -824,8 +1410,14 @@ def build_analysis_document(
         "",
         "---",
         "",
-        "\n\n".join(portraits),
     ]
+    if discussion_minutes:
+        sections.extend((discussion_minutes, "", "---", ""))
+    sections.extend((
+        "## 用户画像",
+        "",
+        "\n\n".join(portraits),
+    ))
     if featured_quotes:
         sections.extend(
             (
@@ -869,7 +1461,12 @@ def extract_chat_name(transcript: str) -> str | None:
     return match.group("chat_name").strip() if match else None
 
 
-def render_html(analysis: str, *, chat_name: str | None = None) -> str:
+def render_html(
+    analysis: str,
+    *,
+    chat_name: str | None = None,
+    discussion: discussion_analysis.DiscussionReport | None = None,
+) -> str:
     """Wrap untrusted model text in a safe, scannable standalone HTML document."""
 
     rendered_markdown = markdown.markdown(
@@ -888,12 +1485,16 @@ def render_html(analysis: str, *, chat_name: str | None = None) -> str:
     member_count_match = re.search(r"(?m)^-\s+\*\*分析成员\*\*：(\d+) 位", analysis)
     member_count = member_count_match.group(1) if member_count_match else "—"
     report_title = f"{chat_name} · 群员画像" if chat_name else "群员画像"
+    chart_payload = json.dumps(
+        discussion.chart_payload() if discussion else None, ensure_ascii=False
+    ).replace("</", "<\\/")
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{escape(report_title)}</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
   <style>
     :root {{ color-scheme: light; font-family: "Microsoft YaHei", "Noto Sans SC", sans-serif; }}
     * {{ box-sizing: border-box; }}
@@ -922,6 +1523,11 @@ def render_html(analysis: str, *, chat_name: str | None = None) -> str:
     .overview-copy li {{ margin: 0; padding: 0 0 9px; border: 0; line-height: 1.72; }}
     .overview-facts {{ display: grid; gap: 8px; }}
     .overview-facts li {{ margin: 0; padding: 8px 10px; background: #fffefd; border: 1px solid #d3e1e7; border-radius: 8px; font-size: .9rem; line-height: 1.55; }}
+    .discussion-minutes {{ margin: 2.5rem 0; padding: 24px 26px; background: #fbf7ee; border: 1px solid #ead9bd; border-radius: 14px; break-inside: avoid; page-break-inside: avoid; }}
+    .discussion-minutes h2 {{ margin-top: 0; }}
+    .discussion-chart {{ min-height: 280px; margin: 1rem 0; }}
+    .discussion-topic {{ margin: 1.4rem 0 0; padding: 17px 18px; background: #fffefd; border-left: 3px solid #c17b3f; border-radius: 0 10px 10px 0; break-inside: avoid; page-break-inside: avoid; }}
+    .discussion-topic h3 {{ margin-top: 0; }}
     .member-card {{ position: relative; margin: 18px 0; padding: 24px 26px 22px; background: #fff; border: 1px solid #d8e2e6; border-radius: 14px; box-shadow: 0 5px 16px #17364b0a; break-inside: avoid; page-break-inside: avoid; }}
     .member-card.featured {{ padding-top: 28px; border-color: #8fb0c0; border-left: 5px solid #2f667e; background: linear-gradient(110deg, #f4f9fb 0%, #fff 42%); }}
     .member-card h3 {{ margin: 0 0 14px; padding-right: 48px; font-size: 1.2rem; }}
@@ -1010,14 +1616,91 @@ def render_html(analysis: str, *, chat_name: str | None = None) -> str:
           overviewLayout.append(overviewCopy, overviewFacts);
         }}
       }}
+      window.__qqstalkerDiscussionChartState = "not-needed";
+      const discussionHeading = Array.from(analysis.children).find(
+        (element) => element.tagName === "H2" && element.textContent.trim() === "讨论纪要",
+      );
+      if (discussionHeading) {{
+        const discussion = document.createElement("section");
+        discussion.className = "discussion-minutes";
+        analysis.insertBefore(discussion, discussionHeading);
+        let element = discussionHeading;
+        while (element && element.tagName !== "HR") {{
+          const next = element.nextElementSibling;
+          discussion.appendChild(element);
+          element = next;
+        }}
+        const heatHeading = Array.from(discussion.children).find(
+          (item) => item.tagName === "H3" && item.textContent.trim() === "讨论热度",
+        );
+        if (heatHeading) {{
+          const chart = document.createElement("div");
+          chart.className = "discussion-chart";
+          heatHeading.before(chart);
+          const fallback = document.createElement("div");
+          fallback.className = "discussion-fallback";
+          heatHeading.before(fallback);
+          fallback.appendChild(heatHeading);
+          if (heatHeading.nextElementSibling?.tagName === "TABLE") {{
+            fallback.appendChild(heatHeading.nextElementSibling);
+          }}
+          const chartData = {chart_payload};
+          if (!chartData || !window.echarts) {{
+            window.__qqstalkerDiscussionChartState = "failed";
+          }} else {{
+            try {{
+              const instance = window.echarts.init(chart);
+              instance.setOption({{
+                animation: false,
+                tooltip: {{ trigger: "axis" }},
+                legend: {{ top: 0 }},
+                grid: {{ left: 42, right: 20, top: 40, bottom: 48 }},
+                xAxis: {{ type: "category", boundaryGap: false, data: chartData.labels }},
+                yAxis: {{ type: "value", minInterval: 1, name: "讨论热度" }},
+                series: chartData.series.map((item) => ({{
+                  name: item.name, type: "line", stack: "heat", smooth: true,
+                  showSymbol: false, data: item.data, lineStyle: {{ color: item.color }},
+                  itemStyle: {{ color: item.color }}, areaStyle: {{ opacity: .55 }},
+                }})),
+              }});
+              fallback.hidden = true;
+              window.__qqstalkerDiscussionChartState = "ready";
+            }} catch (_) {{
+              window.__qqstalkerDiscussionChartState = "failed";
+            }}
+          }}
+        }}
+        Array.from(discussion.children).filter((item) =>
+          item.tagName === "H3" && item.textContent.trim() !== "讨论热度",
+        ).forEach((heading) => {{
+          const topic = document.createElement("section");
+          topic.className = "discussion-topic";
+          heading.before(topic);
+          topic.appendChild(heading);
+          let item = topic.nextElementSibling;
+          while (item && item.tagName !== "H3") {{
+            const next = item.nextElementSibling;
+            topic.appendChild(item);
+            item = next;
+          }}
+        }});
+      }}
       const quotesHeading = Array.from(analysis.children).find(
         (element) => element.tagName === "H2" && element.textContent.trim() === "语录精选",
       );
-      const memberHeadings = Array.from(analysis.children).filter((element) =>
-        element.tagName === "H3" && (!quotesHeading || Boolean(
-          element.compareDocumentPosition(quotesHeading) & Node.DOCUMENT_POSITION_FOLLOWING,
-        )),
+      const portraitsHeading = Array.from(analysis.children).find(
+        (element) => element.tagName === "H2" && element.textContent.trim() === "用户画像",
       );
+      const memberHeadings = Array.from(analysis.children).filter((element) => {{
+        if (element.tagName !== "H3") return false;
+        const afterPortraits = !portraitsHeading || Boolean(
+          portraitsHeading.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING,
+        );
+        const beforeQuotes = !quotesHeading || Boolean(
+          element.compareDocumentPosition(quotesHeading) & Node.DOCUMENT_POSITION_FOLLOWING,
+        );
+        return afterPortraits && beforeQuotes;
+      }});
       memberHeadings.forEach((heading, index) => {{
         const card = document.createElement("section");
         card.className = `member-card${{index < 3 ? " featured" : ""}}`;
@@ -1141,11 +1824,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argument_parser().parse_args()
-    if not args.input_markdown.is_file():
-        raise SystemExit(f"消息记录文件不存在：{args.input_markdown}")
 
     try:
         load_dotenv(args.env_file)
+        max_discussion_topics = positive_integer_setting(
+            "LLM_MAX_DISCUSSION_TOPICS", DEFAULT_MAX_DISCUSSION_TOPICS
+        )
+        discussion_concurrency = positive_integer_setting(
+            "LLM_DISCUSSION_CONCURRENCY", DEFAULT_DISCUSSION_CONCURRENCY
+        )
+        if not args.input_markdown.is_file():
+            raise FileNotFoundError(f"消息记录文件不存在：{args.input_markdown}")
         model = required_setting("LLM_MODEL")
         transcript = args.input_markdown.read_text(encoding="utf-8")
         chat_name = extract_chat_name(transcript)
@@ -1158,6 +1847,12 @@ def main() -> None:
             max_tokens=positive_integer_setting("LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS),
             timeout_seconds=float(
                 positive_integer_setting("LLM_TIMEOUT_SECONDS", int(DEFAULT_TIMEOUT_SECONDS))
+            ),
+            max_retries=nonnegative_integer_setting(
+                "LLM_MAX_RETRIES", DEFAULT_MAX_RETRIES
+            ),
+            retry_delay_seconds=positive_float_setting(
+                "LLM_RETRY_DELAY_SECONDS", DEFAULT_RETRY_DELAY_SECONDS
             ),
             members_per_request=positive_integer_setting(
                 "LLM_MEMBERS_PER_REQUEST",
@@ -1184,10 +1879,17 @@ def main() -> None:
                 DEFAULT_MAX_CONTEXT_CHARACTERS_PER_MEMBER,
             ),
             quote_count=args.quote_count,
+            max_discussion_topics=max_discussion_topics,
+            discussion_concurrency=discussion_concurrency,
         )
+        analysis_markdown, discussion = unpack_analysis_report(analysis)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
-            render_html(analysis, chat_name=chat_name),
+            render_html(
+                analysis_markdown,
+                chat_name=chat_name,
+                discussion=discussion,
+            ),
             encoding="utf-8",
         )
     except (FileNotFoundError, RuntimeError, ValueError) as error:

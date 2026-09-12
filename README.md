@@ -70,6 +70,25 @@ uv run python -m src.qqstalker_cli.render_html_png .\analysis\portrait.html .\an
 uv run python -m src.qqstalker_cli.generate_portrait 2026-09-11 "群名" .\analysis
 ```
 
+### LLM 超时与重试
+
+`.env` 中的 `LLM_TIMEOUT_SECONDS` 控制单个模型请求等待响应的最长秒数，默认 `300`。较慢的模型或较长的聊天记录可提高到 `900`。网络超时、限流（HTTP 429）及服务端临时错误（HTTP 5xx）会自动重试；`LLM_MAX_RETRIES` 是额外重试次数，`LLM_RETRY_DELAY_SECONDS` 是首次等待秒数，后续每次等待翻倍。示例：
+
+```dotenv
+LLM_TIMEOUT_SECONDS=900
+LLM_MAX_RETRIES=3
+LLM_RETRY_DELAY_SECONDS=2
+```
+
+### 思考模式与讨论纪要并发
+
+讨论纪要流水线（分段识别议题 → 归并重复主题 → 逐题撰写纪要）会发起多次模型请求；若使用 GLM、豆包等默认开启思维链的模型，不可见的思维链输出通常是等待时间的主要来源。在 `.env` 中设置 `LLM_THINKING=disabled` 可通过请求中的 `thinking` 字段关闭思维链（仅对支持该字段的服务端生效，留空则不注入）；`LLM_TIMEOUT_SECONDS` 也因此可以保持在默认值。相互独立的纪要请求（分段识别、逐题撰写）默认最多 `4` 个并发，可用 `LLM_DISCUSSION_CONCURRENCY` 调整：
+
+```dotenv
+LLM_THINKING=disabled
+LLM_DISCUSSION_CONCURRENCY=4
+```
+
 ## 实时同步（NapCat）
 
 NapCat 必须已启用 OneBot 11 的 **WebSocket Server**。QQStalker 会主动连接该地址，不使用 NapCat 的反向 WebSocket，也不会发送任何 OneBot action。把下列配置写入本地 `.env`；其中 token 是凭据，不能提交、截图或写入日志：

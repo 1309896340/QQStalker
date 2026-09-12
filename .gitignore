@@ -12,6 +12,8 @@ wheels/
 logs/
 analysis/
 exports/
+# Local LLM request/response trace files written by analyze_transcript.
+temp/
 
 
 

@@ -41,6 +41,10 @@ def generate_portrait(
     """Export, analyze, and render portraits while keeping intermediate files temporary."""
 
     analyze_transcript.load_dotenv(env_file)
+    max_discussion_topics = analyze_transcript.positive_integer_setting(
+        "LLM_MAX_DISCUSSION_TOPICS",
+        analyze_transcript.DEFAULT_MAX_DISCUSSION_TOPICS,
+    )
 
     with tempfile.TemporaryDirectory(prefix="qqstalker-portrait-") as temporary_directory:
         temporary_dir = Path(temporary_directory)
@@ -83,6 +87,14 @@ def generate_portrait(
                     int(analyze_transcript.DEFAULT_TIMEOUT_SECONDS),
                 )
             ),
+            max_retries=analyze_transcript.nonnegative_integer_setting(
+                "LLM_MAX_RETRIES",
+                analyze_transcript.DEFAULT_MAX_RETRIES,
+            ),
+            retry_delay_seconds=analyze_transcript.positive_float_setting(
+                "LLM_RETRY_DELAY_SECONDS",
+                analyze_transcript.DEFAULT_RETRY_DELAY_SECONDS,
+            ),
             members_per_request=analyze_transcript.positive_integer_setting(
                 "LLM_MEMBERS_PER_REQUEST",
                 analyze_transcript.DEFAULT_MEMBERS_PER_REQUEST,
@@ -110,6 +122,7 @@ def generate_portrait(
                 analyze_transcript.DEFAULT_MAX_CONTEXT_CHARACTERS_PER_MEMBER,
             ),
             quote_count=quote_count,
+            max_discussion_topics=max_discussion_topics,
         )
         generated_at = datetime.now()
         html_path = analyze_transcript.resolve_output_path(
@@ -118,8 +131,13 @@ def generate_portrait(
             chat_name=chat_name,
         )
         html_path.parent.mkdir(parents=True, exist_ok=True)
+        analysis_markdown, discussion = analyze_transcript.unpack_analysis_report(analysis)
         html_path.write_text(
-            analyze_transcript.render_html(analysis, chat_name=chat_name),
+            analyze_transcript.render_html(
+                analysis_markdown,
+                chat_name=chat_name,
+                discussion=discussion,
+            ),
             encoding="utf-8",
         )
         output_path = render_html_png.create_output_path(
