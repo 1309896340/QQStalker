@@ -800,12 +800,14 @@ def _minutes_instruction(
         coverage_clause = (
             f"主要参与者名单：{'、'.join(roster)}。"
             "名单中出现在本次输入里的每名成员都必须逐一提及并概括其观点；"
-            "字数紧张时用概括性转述缩短表述，而不是省略成员或照抄长句。"
+            "字数紧张时用概括性转述缩短表述，而不是省略成员或照抄长句；"
+            "未达成结论时也要概括各方观点与讨论走向，不要拿空泛总结充数。"
         )
     else:
         coverage_clause = (
             "纪要必须逐一提及本次输入中出现过的每名主要参与者并概括其观点；"
-            "字数紧张时用概括性转述缩短表述，而不是省略成员或照抄长句。"
+            "字数紧张时用概括性转述缩短表述，而不是省略成员或照抄长句；"
+            "未达成结论时也要概括各方观点与讨论走向，不要拿空泛总结充数。"
         )
     return f"""为议题“{title}”撰写{scope}的讨论纪要，只输出一个由多个简明句子组成的自然段，长度控制在 200~300 字。
 {merge_clause}围绕议题的核心观点、关键分歧与讨论结果归纳成段：合并同类发言，省略寒暄、重复与无关细节。
@@ -944,16 +946,20 @@ def truncate_minutes(paragraph: str, expected: Sequence[str] = ()) -> str:
     budget = MAX_MINUTES_CHARACTERS
     covered: set[str] = set()
     picked: set[int] = set()
-    # 第一遍按原序保住提及尚未覆盖成员的句子，第二遍再回填其余句子。
+    # 第一遍按原序保留"提及尚未覆盖成员"的句子（放得下就要）。注意
+    # find_uncovered_members 返回的是句中未提及的成员，命中者取其补集。
     for index, sentence in enumerate(sentences):
-        fresh = [
+        uncovered_now = [name for name in wanted if name not in covered]
+        if not uncovered_now:
+            break
+        mentioned = [
             name
-            for name in find_uncovered_members(sentence, wanted)
-            if name not in covered
+            for name in uncovered_now
+            if name not in find_uncovered_members(sentence, uncovered_now)
         ]
-        if fresh and len(sentence) <= budget:
+        if mentioned and len(sentence) <= budget:
             picked.add(index)
-            covered.update(fresh)
+            covered.update(mentioned)
             budget -= len(sentence)
     for index, sentence in enumerate(sentences):
         if index not in picked and len(sentence) <= budget:
@@ -961,7 +967,14 @@ def truncate_minutes(paragraph: str, expected: Sequence[str] = ()) -> str:
             budget -= len(sentence)
     if not picked:
         return prefix
-    return "".join(sentences[index] for index in sorted(picked))
+    selected = "".join(sentences[index] for index in sorted(picked))
+    # 选句结果必须比确定性前缀覆盖更多成员才值得采用；巨型单句装不下
+    # 预算、只剩结尾空泛总结可选时，退回信息量更大的前缀截断。
+    if len(find_uncovered_members(selected, wanted)) < len(
+        find_uncovered_members(prefix, wanted)
+    ):
+        return selected
+    return prefix
 
 
 MINUTES_REQUEST_ATTEMPTS = 3
