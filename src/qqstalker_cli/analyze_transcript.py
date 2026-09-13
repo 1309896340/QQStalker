@@ -22,7 +22,7 @@ import bleach
 import httpx
 import markdown
 
-from src.qqstalker_cli import contextual_analysis, discussion_analysis
+from src.qqstalker_cli import contextual_analysis, discussion_analysis, llm_cache
 from src.qqstalker_cli.concurrency import run_items
 from src.qqstalker_cli.llm_progress import (
     LlmProgressReporter,
@@ -1053,6 +1053,20 @@ def request_portraits(
     ):
         raise ValueError("progress_interval_seconds 必须是非负数")
 
+    cache = llm_cache.active()
+    cache_key = None
+    if cache is not None:
+        cache_key = llm_cache.cache_key(
+            stage_label=stage_label,
+            base_url=base_url,
+            model=model,
+            max_tokens=max_tokens,
+            prompt=prompt,
+        )
+        cached = cache.lookup(cache_key)
+        if cached is not None:
+            return cached
+
     def emit(text: str) -> None:
         if reporter is not None:
             reporter.print(text)
@@ -1210,6 +1224,8 @@ def request_portraits(
     write_llm_response_trace(
         response_trace_path, stage_label=stage_label, model=model, content=content
     )
+    if cache is not None and cache_key is not None:
+        cache.store(cache_key, content, finish_reason)
     return content, finish_reason
 
 
@@ -2125,6 +2141,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=DEFAULT_FEATURED_QUOTE_COUNT,
         help=f"语录精选的目标条数（默认：{DEFAULT_FEATURED_QUOTE_COUNT}）",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="本次运行不读写大模型响应缓存",
+    )
     return parser
 
 
@@ -2149,6 +2170,8 @@ def main() -> None:
         transcript = args.input_markdown.read_text(encoding="utf-8")
         chat_name = extract_chat_name(transcript)
         output_path = resolve_output_path(args.output_html, chat_name=chat_name)
+        if not args.no_cache:
+            llm_cache.install(llm_cache.LlmResponseCache(output_path.parent))
         analysis = analyze_all_members(
             transcript,
             base_url=required_setting("LLM_BASE_URL"),

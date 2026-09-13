@@ -246,6 +246,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=4,
         help="每张拼接图片包含的分片数量（仅 --stitch-horizontal 生效，默认：4）",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="本次运行不读写大模型响应缓存",
+    )
     return parser
 
 
@@ -256,6 +261,10 @@ def main() -> None:
         raise SystemExit("--end-date 不能早于 start_date")
     try:
         timezone = ZoneInfo(args.timezone)
+        if not args.no_cache:
+            analyze_transcript.llm_cache.install(
+                analyze_transcript.llm_cache.LlmResponseCache(args.output_dir)
+            )
         paths = generate_portrait(
             args.start_date,
             end_date,

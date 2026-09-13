@@ -109,6 +109,111 @@ class SelectMembersTests(unittest.TestCase):
         self.assertEqual([member for member, _ in selected], ["乙", "丙", "甲"])
 
 
+class LlmResponseCacheTests(unittest.TestCase):
+    """Cache hits skip the network; failures are never persisted."""
+
+    def tearDown(self) -> None:
+        analyze_transcript.llm_cache.uninstall()
+
+    def test_store_then_lookup_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = analyze_transcript.llm_cache.LlmResponseCache(Path(tmp))
+            key = analyze_transcript.llm_cache.cache_key(
+                stage_label="测试",
+                base_url="https://example.test",
+                model="test-model",
+                max_tokens=10,
+                prompt="提示",
+            )
+
+            self.assertIsNone(cache.lookup(key))
+            cache.store(key, "响应文本", "stop")
+            self.assertEqual(cache.lookup(key), ("响应文本", "stop"))
+
+    def test_lookup_drops_corrupt_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = analyze_transcript.llm_cache.LlmResponseCache(Path(tmp))
+            key = analyze_transcript.llm_cache.cache_key(
+                stage_label="测试",
+                base_url="https://example.test",
+                model="test-model",
+                max_tokens=10,
+                prompt="提示",
+            )
+            cache.directory.mkdir(parents=True, exist_ok=True)
+            cache._path(key).write_text("{broken", encoding="utf-8")
+
+            self.assertIsNone(cache.lookup(key))
+            self.assertFalse(cache._path(key).exists())
+
+    def test_cache_key_covers_model_stage_and_params(self) -> None:
+        base = {
+            "stage_label": "测试",
+            "base_url": "https://example.test",
+            "model": "test-model",
+            "max_tokens": 10,
+            "prompt": "提示",
+        }
+        build = analyze_transcript.llm_cache.cache_key
+
+        self.assertEqual(build(**base), build(**base))
+        self.assertNotEqual(build(**base), build(**{**base, "model": "other"}))
+        self.assertNotEqual(build(**base), build(**{**base, "max_tokens": 20}))
+        self.assertNotEqual(build(**base), build(**{**base, "stage_label": "其他"}))
+        self.assertNotEqual(build(**base), build(**{**base, "prompt": "另提示"}))
+
+    def test_request_portraits_uses_cache_and_failures_do_not_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            analyze_transcript.llm_cache.install(
+                analyze_transcript.llm_cache.LlmResponseCache(Path(tmp))
+            )
+            with (
+                patch.object(analyze_transcript.httpx, "Client") as client_class,
+                patch.dict(os.environ, {"LLM_STREAM": "1"}),
+            ):
+                client = client_class.return_value.__enter__.return_value
+                client.stream.return_value = make_stream_context(
+                    StreamingTransportTests.STREAM_LINES
+                )
+                first = analyze_transcript.request_portraits(
+                    "测试请求",
+                    base_url="https://example.test",
+                    model="test-model",
+                    api_key="test-key",
+                    max_tokens=100,
+                    timeout_seconds=1,
+                )
+                client.stream.reset_mock()
+                second = analyze_transcript.request_portraits(
+                    "测试请求",
+                    base_url="https://example.test",
+                    model="test-model",
+                    api_key="test-key",
+                    max_tokens=100,
+                    timeout_seconds=1,
+                )
+
+            self.assertEqual(first, second)
+            self.assertEqual(client.stream.call_count, 0)
+
+            with (
+                patch.object(analyze_transcript.httpx, "Client") as failing_class,
+                patch.dict(os.environ, {"LLM_STREAM": "1"}),
+            ):
+                failing_client = failing_class.return_value.__enter__.return_value
+                failing_client.stream.side_effect = httpx.TransportError("断网")
+                with self.assertRaises(RuntimeError):
+                    analyze_transcript.request_portraits(
+                        "会失败的请求",
+                        base_url="https://example.test",
+                        model="test-model",
+                        api_key="test-key",
+                        max_tokens=100,
+                        timeout_seconds=1,
+                        max_retries=0,
+                    )
+
+
 class FeaturedQuotesNormalizationTests(unittest.TestCase):
     def test_sample_message_blocks_keeps_budget_and_coverage(self) -> None:
         blocks = [
