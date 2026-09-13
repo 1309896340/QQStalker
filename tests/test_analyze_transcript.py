@@ -1294,6 +1294,137 @@ class DiscussionMinutesTests(unittest.TestCase):
             [discussion_analysis.topic_color(index) for index in range(12)],
         )
 
+    def test_segment_refusal_isolates_to_skipped_fragment(self) -> None:
+        """A refused chunk must not abort the other segments' topic detection."""
+
+        timestamp = datetime(2026, 9, 11, 9, 0)
+        source = tuple(
+            contextual_analysis.TranscriptMessage(
+                index, timestamp.replace(hour=9 + index), "甲", f"消息{index}内容", ""
+            )
+            for index in range(6)
+        )
+
+        def scripted_request(prompt: str) -> str:
+            if "候选议题如下" in prompt:
+                payload = prompt.split("候选议题如下：\n", 1)[1]
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "id": "g1",
+                                "title": "有效讨论",
+                                "summary": "摘要",
+                                "source_ids": re.findall(r'"id":"([^"]+)"', payload),
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            if "讨论纪要" in prompt:
+                return "甲提出观点并作出总结。乙补充事实并反思讨论结果。"
+            if "start_line" in prompt:
+                if "消息3" in prompt:
+                    return "抱歉，我无法回答这个问题。"
+                positions = [
+                    int(value) for value in re.findall(r"(?m)^\[(\d+) \|", prompt)
+                ]
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "id": "t1",
+                                "title": "有效讨论",
+                                "summary": "摘要",
+                                "substantive": True,
+                                "start_line": positions[0],
+                                "end_line": positions[-1],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            raise AssertionError(f"未预期的请求：{prompt[:60]}")
+
+        report = discussion_analysis.analyze_discussion_minutes(
+            source,
+            maximum_topics=5,
+            maximum_input_characters=500,
+            request_text=scripted_request,
+        )
+        chunks = discussion_analysis.build_segment_prompt_chunks(
+            discussion_analysis.filter_discussion_messages(source),
+            maximum_characters=500,
+        )
+        refused_total = sum(
+            len(chunk.messages) for chunk in chunks if "消息3" in chunk.prompt
+        )
+        self.assertGreater(refused_total, 0)
+        self.assertEqual([topic.title for topic in report.topics], ["有效讨论"])
+        self.assertEqual(
+            sum(topic.message_count for topic in report.topics), 6 - refused_total
+        )
+
+    def test_topic_minutes_failure_keeps_topic_entry(self) -> None:
+        """A refused minutes request degrades one topic instead of the whole section."""
+
+        timestamp = datetime(2026, 9, 11, 9, 0)
+        source = tuple(
+            contextual_analysis.TranscriptMessage(
+                index, timestamp.replace(hour=9 + index), "甲", f"消息{index}内容", ""
+            )
+            for index in range(2)
+        )
+
+        def scripted_request(prompt: str) -> str:
+            if "候选议题如下" in prompt:
+                payload = prompt.split("候选议题如下：\n", 1)[1]
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "id": "g1",
+                                "title": "有效讨论",
+                                "summary": "摘要",
+                                "source_ids": re.findall(r'"id":"([^"]+)"', payload),
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            if "讨论纪要" in prompt:
+                return "抱歉，我无法回答这个问题。"
+            positions = [
+                int(value) for value in re.findall(r"(?m)^\[(\d+) \|", prompt)
+            ]
+            return json.dumps(
+                {
+                    "topics": [
+                        {
+                            "id": "t1",
+                            "title": "有效讨论",
+                            "summary": "摘要",
+                            "substantive": True,
+                            "start_line": positions[0],
+                            "end_line": positions[-1],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+
+        report = discussion_analysis.analyze_discussion_minutes(
+            source,
+            maximum_topics=5,
+            maximum_input_characters=2000,
+            request_text=scripted_request,
+        )
+        self.assertEqual(len(report.topics), 1)
+        self.assertEqual(report.topics[0].message_count, 2)
+        self.assertEqual(
+            report.topics[0].minutes, "该议题的纪要生成失败，未能概括讨论内容。"
+        )
+
     def test_segment_window_bounds_classification_chunks(self) -> None:
         """Segment prompts stay in a window where exact id coverage stays reliable."""
 
@@ -1327,6 +1458,12 @@ class DiscussionMinutesTests(unittest.TestCase):
                 raise RuntimeError("start_line 必须是整数")
             return response
 
+        with self.assertRaisesRegex(RuntimeError, "start_line 必须是整数"):
+            discussion_analysis._validated_request(
+                "原始提示",
+                request_text=lambda prompt: (prompts.append(prompt), "bad")[1],
+                parser=parser,
+            )
         result = discussion_analysis._validated_request(
             "原始提示",
             request_text=lambda prompt: (prompts.append(prompt), next(responses))[1],
@@ -1334,10 +1471,56 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
 
         self.assertEqual(result, "good")
-        self.assertEqual(len(prompts), 2)
+        self.assertEqual(len(prompts), 4)
         self.assertTrue(prompts[1].startswith("原始提示"))
         self.assertIn("start_line 必须是整数", prompts[1])
         self.assertIn("重新完整输出", prompts[1])
+
+    def test_rejection_error_carries_response_head(self) -> None:
+        """Refusal texts must surface in errors so the trigger can be reviewed."""
+
+        messages = (
+            discussion_analysis.DiscussionMessage(1, datetime(2026, 9, 11), "甲", "甲说话"),
+            discussion_analysis.DiscussionMessage(2, datetime(2026, 9, 11), "乙", "乙说话"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "响应开头：抱歉，我无法回答这个问题"):
+            discussion_analysis.parse_segment_response(
+                "抱歉，我无法回答这个问题。",
+                expected_messages=messages,
+                namespace="test",
+            )
+
+    def test_refusal_trace_dump_uses_timestamped_name(self) -> None:
+        """Refused requests land in temp/ as YYYYmmddHHMMSS_illegal.md."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            pattern = re.compile(r"^\d{14}_illegal(?:_\d+)?\.md$")
+            discussion_analysis.write_refusal_trace(
+                3,
+                prompt="完整请求内容",
+                response="抱歉，我无法回答这个问题。",
+                message_ids=(31, 45),
+                error="讨论议题响应不是 JSON 对象（响应开头：抱歉）",
+                directory=directory,
+            )
+            discussion_analysis.write_refusal_trace(
+                4,
+                prompt="第二份完整请求内容",
+                response="抱歉，您的问题我无法识别。",
+                message_ids=(46, 58),
+                error="讨论议题响应不是 JSON 对象（响应开头：抱歉）",
+                directory=directory,
+            )
+
+            dumps = sorted(path for path in directory.iterdir() if pattern.match(path.name))
+            self.assertEqual(len(dumps), 2)
+            first_text = dumps[0].read_text(encoding="utf-8")
+            self.assertIn("完整请求内容", first_text)
+            self.assertIn("抱歉，我无法回答这个问题。", first_text)
+            self.assertIn("31–45", first_text)
+            second_text = dumps[1].read_text(encoding="utf-8")
+            self.assertIn("第二份完整请求内容", second_text)
 
     def test_thinking_control_setting_accepts_only_enabled_or_disabled(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

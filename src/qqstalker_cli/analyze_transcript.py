@@ -1338,6 +1338,10 @@ def analyze_all_members(
             )
             if finish_reason == "length":
                 raise RuntimeError("讨论纪要输出被截断；请提高 LLM_MAX_TOKENS 后重试")
+            if finish_reason == "content_filter":
+                raise RuntimeError(
+                    "响应被服务端内容审查拦截（finish_reason=content_filter）"
+                )
             return response
 
         discussion = discussion_analysis.analyze_discussion_minutes(

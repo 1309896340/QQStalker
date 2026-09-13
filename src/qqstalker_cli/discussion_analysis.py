@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
 import re
+from pathlib import Path
 from typing import Callable, Iterable, Sequence, TypeVar
 
 from src.qqstalker_cli.contextual_analysis import TranscriptMessage
@@ -324,11 +325,15 @@ def _response_object(response: str) -> dict[str, object]:
         text = "\n".join(text.splitlines()[1:-1]).strip()
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end < start:
-        raise RuntimeError("讨论议题响应不是 JSON 对象")
+        raise RuntimeError(
+            f"讨论议题响应不是 JSON 对象（响应开头：{text[:60]}）"
+        )
     try:
         root = json.loads(text[start : end + 1])
     except json.JSONDecodeError as error:
-        raise RuntimeError("讨论议题响应不是有效 JSON") from error
+        raise RuntimeError(
+            f"讨论议题响应不是有效 JSON（{error}；响应开头：{text[:60]}）"
+        ) from error
     if not isinstance(root, dict):
         raise RuntimeError("讨论议题响应根节点必须是对象")
     return root
@@ -524,6 +529,53 @@ def parse_merge_response(
 T = TypeVar("T")
 U = TypeVar("U")
 
+REFUSAL_TRACE_DIRECTORY = Path(__file__).resolve().parents[2] / "temp"
+
+
+class ValidatedResponseError(RuntimeError):
+    """A validation failure carrying the rejected model response text."""
+
+    def __init__(self, message: str, response: str) -> None:
+        super().__init__(message)
+        self.response = response
+
+
+def write_refusal_trace(
+    position: int,
+    *,
+    prompt: str,
+    response: str,
+    message_ids: tuple[int, ...],
+    error: str,
+    directory: Path = REFUSAL_TRACE_DIRECTORY,
+) -> None:
+    """Dump a refused segment's full request for sensitive-content review."""
+
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        path = directory / f"{stamp}_illegal.md"
+        index = 2
+        while path.exists():
+            path = directory / f"{stamp}_illegal_{index}.md"
+            index += 1
+        path.write_text(
+            "# 讨论分段识别拒答记录\n\n"
+            f"- 时间：{datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            f"- 分段：segment-{position}\n"
+            f"- 消息编号：{message_ids[0]}–{message_ids[-1]}"
+            f"（共 {len(message_ids)} 条）\n"
+            f"- 错误：{error}\n\n"
+            "## 模型原始响应\n\n"
+            f"{response or '（空）'}\n\n"
+            "## 完整请求内容\n\n"
+            f"{prompt}\n",
+            encoding="utf-8",
+        )
+        print(f"已写入拒答记录（供敏感内容排查）：{path}", flush=True)
+    except OSError as os_error:
+        print(f"警告：无法写入拒答记录：{os_error}", flush=True)
+
 
 def _validated_request(
     prompt: str, *, request_text: RequestText, parser: Callable[[str], T]
@@ -531,6 +583,7 @@ def _validated_request(
     """Retry one malformed response with the validation error as feedback."""
 
     error: RuntimeError | None = None
+    response = ""
     for attempt in range(2):
         request_prompt = prompt
         if attempt and error is not None:
@@ -540,9 +593,10 @@ def _validated_request(
                 "请严格按原始要求修正该问题并重新完整输出。"
             )
         try:
-            return parser(request_text(request_prompt))
+            response = request_text(request_prompt)
+            return parser(response)
         except RuntimeError as caught:
-            error = caught
+            error = ValidatedResponseError(str(caught), response)
     assert error is not None
     raise error
 
@@ -622,7 +676,9 @@ def _normalize_minutes_text(response: str) -> str:
     paragraph = "".join(lines).strip()
     paragraph = paragraph.replace("**", "").replace("__", "")
     if not paragraph or len(SENTENCE_END_PATTERN.findall(paragraph)) < 2:
-        raise RuntimeError("讨论纪要必须是包含多个句子的自然段")
+        raise RuntimeError(
+            f"讨论纪要必须是包含多个句子的自然段（响应开头：{paragraph[:60] or text[:60]}）"
+        )
     return paragraph
 
 
@@ -832,30 +888,66 @@ def analyze_discussion_minutes(
         effective, maximum_characters=maximum_input_characters
     )
 
-    def classify_chunk(positioned: tuple[int, PromptChunk]) -> tuple[TopicCandidate, ...]:
+    def classify_chunk(
+        positioned: tuple[int, PromptChunk],
+    ) -> tuple[tuple[TopicCandidate, ...], TopicCandidate | None]:
         position, chunk = positioned
-        return _validated_request(
-            chunk.prompt,
-            request_text=request_text,
-            parser=lambda response, chunk=chunk, namespace=f"segment-{position}": parse_segment_response(
-                response,
-                expected_messages=chunk.messages,
-                namespace=namespace,
-            ),
-        )
+        try:
+            return (
+                _validated_request(
+                    chunk.prompt,
+                    request_text=request_text,
+                    parser=lambda response, chunk=chunk, namespace=f"segment-{position}": parse_segment_response(
+                        response,
+                        expected_messages=chunk.messages,
+                        namespace=namespace,
+                    ),
+                ),
+                None,
+            )
+        except RuntimeError as error:
+            message_ids = tuple(message.index for message in chunk.messages)
+            response = error.response if isinstance(error, ValidatedResponseError) else ""
+            write_refusal_trace(
+                position,
+                prompt=chunk.prompt,
+                response=response,
+                message_ids=message_ids,
+                error=str(error),
+            )
+            print(
+                "警告：讨论议题识别的分段请求失败，"
+                f"消息编号 {message_ids[0]}–{message_ids[-1]} 共 "
+                f"{len(message_ids)} 条不计入任何议题：{error}",
+                flush=True,
+            )
+            return (
+                (),
+                TopicCandidate(
+                    f"segment-{position}:skipped",
+                    "未识别片段",
+                    "该段消息未能完成议题识别",
+                    message_ids,
+                    False,
+                ),
+            )
 
     local: list[TopicCandidate] = []
-    for candidates in _run_items(
+    skipped: list[TopicCandidate] = []
+    for candidates, failed in _run_items(
         tuple(enumerate(chunks)),
         worker=classify_chunk,
         maximum_workers=maximum_workers,
     ):
         local.extend(candidates)
+        if failed is not None:
+            skipped.append(failed)
     merged = merge_topic_candidates(
         tuple(local),
         maximum_characters=maximum_input_characters,
         request_text=request_text,
     )
+    merged = tuple(merged) + tuple(skipped)
     selected = tuple(
         sorted(
             (item for item in merged if item.substantive),
@@ -877,6 +969,19 @@ def analyze_discussion_minutes(
                 counts.items(), key=lambda item: (-item[1], first_positions[item[0]])
             )[:5]
         )
+        try:
+            minutes = summarize_topic(
+                candidate,
+                messages_by_id=messages_by_id,
+                maximum_characters=maximum_input_characters,
+                request_text=request_text,
+            )
+        except RuntimeError as error:
+            print(
+                f"警告：议题“{candidate.title}”的纪要生成失败，已保留议题条目：{error}",
+                flush=True,
+            )
+            minutes = "该议题的纪要生成失败，未能概括讨论内容。"
         return DiscussionTopic(
             candidate.candidate_id,
             candidate.title,
@@ -885,12 +990,7 @@ def analyze_discussion_minutes(
             min(item.timestamp for item in topic_messages),
             max(item.timestamp for item in topic_messages),
             participants,
-            summarize_topic(
-                candidate,
-                messages_by_id=messages_by_id,
-                maximum_characters=maximum_input_characters,
-                request_text=request_text,
-            ),
+            minutes,
         )
 
     topic_tuple = tuple(
