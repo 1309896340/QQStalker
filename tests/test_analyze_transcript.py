@@ -1665,6 +1665,10 @@ class DiscussionMinutesTests(unittest.TestCase):
             discussion_analysis.normalize_minutes("甲说了一句话。乙回应一句。"),
             "甲说了一句话。乙回应一句。",
         )
+        self.assertEqual(
+            discussion_analysis.normalize_minutes("<<王小明>>提出观点。王小明回应。"),
+            "<<王小明>>提出观点。王小明回应。",
+        )
         long_text = "甲提出观点并说明理由。" * 30
         with self.assertRaisesRegex(RuntimeError, "300"):
             discussion_analysis.normalize_minutes(long_text)
@@ -1712,6 +1716,61 @@ class DiscussionMinutesTests(unittest.TestCase):
             discussion_analysis.bold_member_names("王小明和小明都在", ["小明", "王小明"]),
             "**王小明**和**小明**都在",
         )
+
+    def test_bold_member_names_guard_ascii_boundaries_and_markers(self) -> None:
+        self.assertEqual(
+            discussion_analysis.bold_member_names(
+                "讨论break/continue时nt认为是语法糖。", ["nt"]
+            ),
+            "讨论break/continue时**nt**认为是语法糖。",
+        )
+        self.assertEqual(
+            discussion_analysis.bold_member_names("ntcn是个名字", ["nt"]),
+            "ntcn是个名字",
+        )
+        self.assertEqual(
+            discussion_analysis.bold_member_names("<<王小明>>发言。", ["王小明"]),
+            "**王小明**发言。",
+        )
+        self.assertEqual(
+            discussion_analysis.bold_member_names("<<路人>>发言。", ["王小明"]),
+            "路人发言。",
+        )
+
+    def test_member_aliases_skip_conflicting_stems(self) -> None:
+        self.assertEqual(
+            discussion_analysis.member_aliases(["祥子(ut 不重要了健康才重要）", "nt"]),
+            {"祥子": "祥子(ut 不重要了健康才重要）"},
+        )
+        self.assertEqual(discussion_analysis.member_aliases(["祥子(备注)", "祥子"]), {})
+        self.assertEqual(discussion_analysis.member_aliases(["祥子", "祥子(备注)"]), {})
+
+    def test_member_highlights_match_alias_with_same_color(self) -> None:
+        moment = datetime(2026, 9, 11, 9, 0)
+        member = "祥子(ut 不重要了健康才重要）"
+        report = discussion_analysis.DiscussionReport(
+            (
+                discussion_analysis.DiscussionTopic(
+                    "t1",
+                    "议题",
+                    2,
+                    0,
+                    moment,
+                    moment,
+                    (member,),
+                    f"祥子提出go语言观点。<<{member}>>补充细节。",
+                ),
+            ),
+            (),
+            (),
+            "day",
+        )
+        highlighted = report.with_member_highlights([member])
+        styles = highlighted.member_styles or {}
+
+        self.assertEqual(styles["祥子"], styles[member])
+        self.assertIn("**祥子**提出go语言观点。", highlighted.topics[0].minutes)
+        self.assertIn(f"**{member}**补充细节。", highlighted.topics[0].minutes)
 
     def test_topic_colors_stay_distinct_beyond_palette(self) -> None:
         palette = discussion_analysis.TOPIC_COLORS
