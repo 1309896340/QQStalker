@@ -802,6 +802,52 @@ def normalize_minutes(response: str) -> str:
     return paragraph
 
 
+MINUTES_EXCERPT_LIMIT = 8
+MINUTES_EXCERPT_CHARACTERS = 60
+
+
+def fallback_minutes_excerpt(
+    messages: Sequence[DiscussionMessage], *, reason: str
+) -> str:
+    """Compose a deterministic, speaker-balanced excerpt after minutes failure."""
+
+    reason_head = re.split(r"[。；;\n]", reason, maxsplit=1)[0].strip()[:80]
+    header = f"模型纪要生成失败（{reason_head}）"
+    by_member: dict[str, list[DiscussionMessage]] = {}
+    for message in messages:
+        by_member.setdefault(message.member, []).append(message)
+    ordered_members = sorted(by_member, key=lambda name: (-len(by_member[name]), name))
+    ranked = {
+        member: sorted(
+            member_messages, key=lambda message: -len(message.content)
+        )
+        for member, member_messages in by_member.items()
+    }
+    picked: list[DiscussionMessage] = []
+    picked_indices: set[int] = set()
+    for round_index in range(2):
+        for member in ordered_members:
+            if len(picked) >= MINUTES_EXCERPT_LIMIT:
+                break
+            if round_index < len(ranked[member]):
+                choice = ranked[member][round_index]
+                if choice.index not in picked_indices:
+                    picked.append(choice)
+                    picked_indices.add(choice.index)
+    if not picked:
+        return f"{header}，且该议题没有可摘录的文字消息。"
+    picked.sort(key=lambda message: (message.timestamp, message.index))
+    lines = [f"{header}，以下为主要发言摘录："]
+    for message in picked:
+        content = message.content
+        ellipsis = "…" if len(content) > MINUTES_EXCERPT_CHARACTERS else ""
+        lines.append(
+            f"- [{message.timestamp:%H:%M}] {message.member}："
+            f"{content[:MINUTES_EXCERPT_CHARACTERS]}{ellipsis}"
+        )
+    return "\n".join(lines)
+
+
 def truncate_minutes(paragraph: str) -> str:
     """Deterministically cap a paragraph at the limit on sentence boundaries."""
 
@@ -1106,7 +1152,7 @@ def analyze_discussion_minutes(
                 f"警告：议题“{candidate.title}”的纪要生成失败，已保留议题条目：{error}",
                 flush=True,
             )
-            minutes = "该议题的纪要生成失败，未能概括讨论内容。"
+            minutes = fallback_minutes_excerpt(topic_messages, reason=str(error))
         return DiscussionTopic(
             candidate.candidate_id,
             candidate.title,

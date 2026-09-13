@@ -2255,9 +2255,45 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
         self.assertEqual(len(report.topics), 1)
         self.assertEqual(report.topics[0].message_count, 2)
-        self.assertEqual(
-            report.topics[0].minutes, "该议题的纪要生成失败，未能概括讨论内容。"
+        self.assertIn("模型纪要生成失败", report.topics[0].minutes)
+        self.assertIn("[10:00] **甲**：消息1内容", report.topics[0].minutes)
+
+    def test_fallback_minutes_excerpt_balances_members_and_truncates(self) -> None:
+        moment = datetime(2026, 9, 11, 14, 22)
+        messages = [
+            discussion_analysis.DiscussionMessage(
+                1, datetime(2026, 9, 11, 14, 20), "甲", "甲的短消息"
+            ),
+            discussion_analysis.DiscussionMessage(
+                2, moment, "乙", "乙的长" * 60
+            ),
+            discussion_analysis.DiscussionMessage(
+                3, datetime(2026, 9, 11, 14, 24), "甲", "甲的重要补充内容，比较长的一段发言"
+            ),
+            discussion_analysis.DiscussionMessage(
+                4, datetime(2026, 9, 11, 14, 26), "丙", "丙的唯一发言"
+            ),
+        ]
+
+        excerpt = discussion_analysis.fallback_minutes_excerpt(
+            messages, reason="响应被服务端内容审查拦截（finish_reason=content_filter）"
         )
+
+        self.assertIn("模型纪要生成失败（响应被服务端内容审查拦截", excerpt)
+        self.assertIn("- [14:20] 甲：甲的短消息", excerpt)
+        self.assertIn("甲的重要补充内容", excerpt)
+        self.assertIn("- [14:22] 乙：", excerpt)
+        self.assertTrue(
+            any(line.startswith("- [14:22] 乙：") and line.endswith("…") for line in excerpt.splitlines())
+        )
+        self.assertIn("- [14:26] 丙：丙的唯一发言", excerpt)
+        # 三名参与者各至少一条，时间升序
+        self.assertLess(excerpt.index("[14:20]"), excerpt.index("[14:26]"))
+
+        empty = discussion_analysis.fallback_minutes_excerpt(
+            [], reason="流式响应未产生增量文本"
+        )
+        self.assertIn("没有可摘录的文字消息", empty)
 
     def test_fallback_llm_setting_requires_complete_configuration(self) -> None:
         """The fallback model is either fully configured or disabled entirely."""
