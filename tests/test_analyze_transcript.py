@@ -1104,6 +1104,64 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
         self.assertEqual([item.substantive for item in merged], [True, False])
 
+    def test_merge_response_repairs_duplicate_source_assignment(self) -> None:
+        sources = (
+            discussion_analysis.TopicCandidate("s:a", "甲题", "摘要", (1,), True),
+            discussion_analysis.TopicCandidate("s:b", "乙题", "摘要", (2,), False),
+            discussion_analysis.TopicCandidate("s:c", "丙题", "摘要", (3,), False),
+        )
+        output = StringIO()
+        with redirect_stdout(output):
+            merged = discussion_analysis.parse_merge_response(
+                '{"topics":[{"id":"g1","title":"合并","summary":"摘要","source_ids":["s:a","s:b"]},'
+                '{"id":"g2","title":"重复","summary":"摘要","source_ids":["s:a","s:c"]}]}',
+                sources=sources,
+                namespace="test",
+            )
+        self.assertEqual(
+            [item.candidate_id for item in merged], ["test:g1", "test:g2"]
+        )
+        self.assertEqual(merged[0].message_indices, (1, 2))
+        self.assertEqual(merged[1].message_indices, (3,))
+        self.assertIn("s:a", output.getvalue())
+
+    def test_merge_response_keeps_uncovered_candidates_as_singletons(self) -> None:
+        sources = (
+            discussion_analysis.TopicCandidate("s:a", "甲题", "摘要", (1,), True),
+            discussion_analysis.TopicCandidate("s:b", "乙题", "摘要", (2,), False),
+        )
+        output = StringIO()
+        with redirect_stdout(output):
+            merged = discussion_analysis.parse_merge_response(
+                '{"topics":[{"id":"g1","title":"合并","summary":"摘要","source_ids":["s:a"]}]}',
+                sources=sources,
+                namespace="test",
+            )
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[1].candidate_id, "test:s:b")
+        self.assertEqual(merged[1].title, "乙题")
+        self.assertEqual(merged[1].message_indices, (2,))
+        self.assertFalse(merged[1].substantive)
+        self.assertIn("s:b", output.getvalue())
+
+    def test_merge_response_renames_duplicate_topic_ids(self) -> None:
+        sources = (
+            discussion_analysis.TopicCandidate("s:a", "甲题", "摘要", (1,), True),
+            discussion_analysis.TopicCandidate("s:b", "乙题", "摘要", (2,), False),
+        )
+        output = StringIO()
+        with redirect_stdout(output):
+            merged = discussion_analysis.parse_merge_response(
+                '{"topics":[{"id":"g1","title":"合并","summary":"摘要","source_ids":["s:a"]},'
+                '{"id":"g1","title":"另一题","summary":"摘要","source_ids":["s:b"]}]}',
+                sources=sources,
+                namespace="test",
+            )
+        self.assertEqual(
+            [item.candidate_id for item in merged], ["test:g1", "test:g1-2"]
+        )
+        self.assertIn("g1-2", output.getvalue())
+
     def test_excludes_unsubstantiated_topics_before_ranking(self) -> None:
         timestamp = datetime(2026, 9, 11, 9, 0)
         source = tuple(

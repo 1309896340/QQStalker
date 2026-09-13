@@ -478,14 +478,20 @@ def _candidate_chunks(
 def parse_merge_response(
     response: str, *, sources: tuple[TopicCandidate, ...], namespace: str
 ) -> tuple[TopicCandidate, ...]:
-    """Validate a complete candidate mapping and merge original message ids."""
+    """Validate a complete candidate mapping and merge original message ids.
+
+    Allocation mistakes the model makes (a candidate claimed by several global
+    topics, candidates left out, repeated or unknown ids) are repaired
+    deterministically instead of failing the whole minutes pipeline; only
+    structurally broken responses still raise and trigger a retry.
+    """
 
     root = _response_object(response)
     raw_topics = root.get("topics")
     if not isinstance(raw_topics, list) or not raw_topics:
         raise RuntimeError("议题归并响应必须包含非空 topics")
     source_map = {item.candidate_id: item for item in sources}
-    assigned: list[str] = []
+    assigned: set[str] = set()
     identifiers: set[str] = set()
     merged: list[TopicCandidate] = []
     for raw in raw_topics:
@@ -493,16 +499,44 @@ def parse_merge_response(
             raise RuntimeError("归并 topics 中的每一项必须是对象")
         identifier = _text(raw.get("id"), "归并议题 id", 100)
         if identifier in identifiers:
-            raise RuntimeError("归并议题 id 不能重复")
+            suffix = 2
+            while f"{identifier}-{suffix}" in identifiers:
+                suffix += 1
+            print(
+                f"警告：归并响应中议题 id {identifier} 重复，已重命名为 {identifier}-{suffix}",
+                flush=True,
+            )
+            identifier = f"{identifier}-{suffix}"
         identifiers.add(identifier)
-        source_ids = raw.get("source_ids")
-        if not isinstance(source_ids, list) or not source_ids or not all(
-            isinstance(item, str) and item for item in source_ids
+        raw_source_ids = raw.get("source_ids")
+        if not isinstance(raw_source_ids, list) or not raw_source_ids or not all(
+            isinstance(item, str) and item for item in raw_source_ids
         ):
             raise RuntimeError("source_ids 必须是非空文本数组")
-        if any(item not in source_map for item in source_ids):
-            raise RuntimeError("归并响应包含未知候选 id")
-        assigned.extend(source_ids)
+        unknown = [item for item in raw_source_ids if item not in source_map]
+        if unknown:
+            print(
+                f"警告：归并响应包含未知候选 id，已忽略：{'、'.join(unknown)}",
+                flush=True,
+            )
+        source_ids: list[str] = []
+        for item in raw_source_ids:
+            if item not in source_map:
+                continue
+            if item in assigned:
+                print(
+                    f"警告：候选 {item} 被归入多个全局议题，已保留首次归属",
+                    flush=True,
+                )
+                continue
+            assigned.add(item)
+            source_ids.append(item)
+        if not source_ids:
+            print(
+                f"警告：归并议题“{identifier}”在去重后未对应任何候选，已跳过",
+                flush=True,
+            )
+            continue
         message_ids = sorted(
             {
                 message_id
@@ -519,15 +553,27 @@ def parse_merge_response(
                 any(source_map[source_id].substantive for source_id in source_ids),
             )
         )
-    if len(assigned) != len(set(assigned)):
-        raise RuntimeError("同一候选不能归入多个全局议题")
-    if set(assigned) != set(source_map):
-        raise RuntimeError("议题归并响应未完整覆盖候选")
+    unclaimed = [item for item in sources if item.candidate_id not in assigned]
+    if unclaimed:
+        print(
+            "警告：归并响应未覆盖候选 "
+            f"{'、'.join(item.candidate_id for item in unclaimed)}，已按独立议题保留",
+            flush=True,
+        )
+        merged.extend(
+            TopicCandidate(
+                f"{namespace}:{item.candidate_id}",
+                item.title,
+                item.summary,
+                item.message_indices,
+                item.substantive,
+            )
+            for item in unclaimed
+        )
     return tuple(merged)
 
 
 T = TypeVar("T")
-U = TypeVar("U")
 
 REFUSAL_TRACE_DIRECTORY = Path(__file__).resolve().parents[2] / "temp"
 
