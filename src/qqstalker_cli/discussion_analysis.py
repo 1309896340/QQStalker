@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
@@ -11,6 +10,7 @@ import re
 from pathlib import Path
 from typing import Callable, Iterable, Sequence, TypeVar
 
+from src.qqstalker_cli.concurrency import run_items
 from src.qqstalker_cli.contextual_analysis import TranscriptMessage
 
 
@@ -647,20 +647,6 @@ def _validated_request(
     raise error
 
 
-def _run_items(
-    items: tuple[T, ...],
-    *,
-    worker: Callable[[T], U],
-    maximum_workers: int,
-) -> tuple[U, ...]:
-    """Run independent per-item requests concurrently, preserving input order."""
-
-    if maximum_workers <= 1 or len(items) <= 1:
-        return tuple(worker(item) for item in items)
-    with ThreadPoolExecutor(max_workers=min(maximum_workers, len(items))) as executor:
-        return tuple(executor.map(worker, items))
-
-
 def merge_topic_candidates(
     candidates: tuple[TopicCandidate, ...],
     *,
@@ -980,7 +966,7 @@ def analyze_discussion_minutes(
 
     local: list[TopicCandidate] = []
     skipped: list[TopicCandidate] = []
-    for candidates, failed in _run_items(
+    for candidates, failed in run_items(
         tuple(enumerate(chunks)),
         worker=classify_chunk,
         maximum_workers=maximum_workers,
@@ -1040,7 +1026,7 @@ def analyze_discussion_minutes(
         )
 
     topic_tuple = tuple(
-        _run_items(
+        run_items(
             selected, worker=write_topic_minutes, maximum_workers=maximum_workers
         )
     )

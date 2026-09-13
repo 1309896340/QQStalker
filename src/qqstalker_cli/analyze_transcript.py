@@ -7,10 +7,9 @@ import json
 import math
 import os
 import re
-import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -23,6 +22,11 @@ import httpx
 import markdown
 
 from src.qqstalker_cli import contextual_analysis, discussion_analysis
+from src.qqstalker_cli.concurrency import run_items
+from src.qqstalker_cli.llm_progress import (
+    LlmProgressReporter,
+    create_llm_progress_reporter,
+)
 
 PROMPT = """分析聊天记录中出现的每个群员的画像。
 
@@ -56,6 +60,7 @@ DEFAULT_MAX_INPUT_CHARACTERS = 24_000
 DEFAULT_FEATURED_QUOTE_COUNT = 8
 DEFAULT_MAX_DISCUSSION_TOPICS = 5
 DEFAULT_DISCUSSION_CONCURRENCY = 4
+DEFAULT_PORTRAIT_CONCURRENCY = 2
 DEFAULT_CONTEXT_MESSAGES_BEFORE = 3
 DEFAULT_CONTEXT_MESSAGES_AFTER = 3
 DEFAULT_MAX_CONTEXT_WINDOWS_PER_MEMBER = 12
@@ -594,12 +599,13 @@ def retry_delay_seconds(*, retry_number: int, initial_delay_seconds: float) -> f
 
 
 def wait_before_llm_retry(
-    error: Exception,
+    error: httpx.HTTPError,
     *,
     retry_number: int,
     max_retries: int,
     initial_delay_seconds: float,
     detail: str = "",
+    emit: Callable[[str], None] | None = None,
 ) -> None:
     """Report and wait before retrying a transient LLM request failure."""
 
@@ -607,12 +613,15 @@ def wait_before_llm_retry(
         retry_number=retry_number,
         initial_delay_seconds=initial_delay_seconds,
     )
-    print(
+    text = (
         "大模型请求暂时失败"
         f"（{error}{detail}）；将在 {delay_seconds:g} 秒后自动重试"
-        f"（第 {retry_number + 1}/{max_retries + 1} 次尝试）。",
-        flush=True,
+        f"（第 {retry_number + 1}/{max_retries + 1} 次尝试）。"
     )
+    if emit is None:
+        print(text, flush=True)
+    else:
+        emit(text)
     time.sleep(delay_seconds)
 
 
@@ -639,7 +648,7 @@ def llm_wait_heartbeat(
     stage_label: str | None,
     *,
     interval_seconds: float,
-    reporter: LiveProgressLine | None = None,
+    on_wait: Callable[[float], None] | None = None,
 ) -> Iterator[None]:
     """Periodically report elapsed wait time while one blocking LLM request runs."""
 
@@ -651,14 +660,15 @@ def llm_wait_heartbeat(
 
     def report_wait() -> None:
         while not stop.wait(interval_seconds):
-            text = (
-                f"{stage_label}：大模型仍在生成，"
-                f"已等待 {format_elapsed_seconds(time.monotonic() - started)}…"
-            )
-            if reporter is None:
-                print(text, flush=True)
+            elapsed_seconds = time.monotonic() - started
+            if on_wait is None:
+                print(
+                    f"{stage_label}：大模型仍在生成，"
+                    f"已等待 {format_elapsed_seconds(elapsed_seconds)}…",
+                    flush=True,
+                )
             else:
-                reporter.refresh(text)
+                on_wait(elapsed_seconds)
 
     watcher = threading.Thread(target=report_wait, daemon=True)
     watcher.start()
@@ -667,56 +677,6 @@ def llm_wait_heartbeat(
     finally:
         stop.set()
         watcher.join()
-
-
-_windows_virtual_terminal_enabled = False
-
-
-def _enable_windows_virtual_terminal() -> None:
-    """Enable ANSI escape processing on Windows consoles (no-op elsewhere)."""
-
-    global _windows_virtual_terminal_enabled
-    if os.name != "nt" or _windows_virtual_terminal_enabled:
-        return
-    os.system("")  # Empty command enables VT processing in the classic console host.
-    _windows_virtual_terminal_enabled = True
-
-
-def stdout_supports_refresh() -> bool:
-    """Whether the current stdout can redraw a progress line in place."""
-
-    try:
-        return bool(sys.stdout.isatty())
-    except (AttributeError, ValueError):
-        return False
-
-
-class LiveProgressLine:
-    """One progress line: refreshes in place on terminals, accumulates otherwise."""
-
-    def __init__(self) -> None:
-        self.refresh_mode = stdout_supports_refresh()
-        self._lock = threading.Lock()
-        self._active = False
-
-    def refresh(self, text: str) -> None:
-        """Replace the line content, printing one line per frame when redirected."""
-
-        with self._lock:
-            if self.refresh_mode:
-                _enable_windows_virtual_terminal()
-                print(f"\r\x1b[2K{text}", end="", flush=True)
-                self._active = True
-            else:
-                print(text, flush=True)
-
-    def end(self) -> None:
-        """Finish the live line so subsequent prints start on a fresh line."""
-
-        with self._lock:
-            if self._active:
-                print(flush=True)
-                self._active = False
 
 
 @dataclass
@@ -787,7 +747,8 @@ def stream_chat_completion(
     accumulator: SseStreamAccumulator,
     stage_label: str | None,
     progress_interval_seconds: float,
-    reporter: LiveProgressLine | None = None,
+    reporter: LlmProgressReporter | None = None,
+    progress_token: object | None = None,
 ) -> tuple[str, str | None]:
     """Run one streaming chat completion, reporting data-driven progress."""
 
@@ -801,15 +762,16 @@ def stream_chat_completion(
             if (
                 stage_label
                 and reporter is not None
+                and progress_token is not None
                 and progress_interval_seconds > 0
                 and accumulator.received_characters
             ):
                 now = time.monotonic()
                 if now - last_progress >= progress_interval_seconds:
-                    reporter.refresh(
-                        f"{stage_label}：大模型正在生成，"
-                        f"已接收 {accumulator.received_characters:,} 字"
-                        f"（已等待 {format_elapsed_seconds(now - frame_started)}）…"
+                    reporter.update(
+                        progress_token,
+                        received_chars=accumulator.received_characters,
+                        note="正在生成",
                     )
                     last_progress = now
     return accumulator.text, accumulator.finish_reason
@@ -901,6 +863,7 @@ def request_portraits(
     stage_label: str | None = None,
     progress_interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
     attempt_counter: list[int] | None = None,
+    reporter: LlmProgressReporter | None = None,
 ) -> tuple[str, str | None]:
     """Call an OpenAI-compatible endpoint with bounded retries for transient failures."""
 
@@ -913,6 +876,12 @@ def request_portraits(
         or progress_interval_seconds < 0
     ):
         raise ValueError("progress_interval_seconds 必须是非负数")
+
+    def emit(text: str) -> None:
+        if reporter is not None:
+            reporter.print(text)
+        else:
+            print(text, flush=True)
 
     use_stream = boolean_setting("LLM_STREAM", True)
     endpoint = f"{base_url.rstrip('/')}/chat/completions"
@@ -928,96 +897,105 @@ def request_portraits(
         payload["thinking"] = thinking
     if stage_label:
         mode = "流式" if use_stream else "非流式"
-        print(
+        emit(
             f"{stage_label}：正在请求大模型（{mode}，输入 {len(prompt):,} 字，"
-            f"最长等待 {format_elapsed_seconds(timeout_seconds)}）…",
-            flush=True,
+            f"最长等待 {format_elapsed_seconds(timeout_seconds)}）…"
         )
     response_trace_path = write_llm_request_trace(
         stage_label=stage_label, model=model, prompt=prompt
     )
     request_started = time.monotonic()
-    progress_reporter = LiveProgressLine() if stage_label else None
+    progress_token = reporter.begin(stage_label) if stage_label and reporter else None
     effective_interval = (
         REFRESH_MODE_INTERVAL_SECONDS
-        if progress_reporter is not None and progress_reporter.refresh_mode
+        if progress_token is not None
         else progress_interval_seconds
     )
+
+    def note_progress(note: str) -> None:
+        if reporter is not None and progress_token is not None:
+            reporter.update(progress_token, note=note)
+
     content: str | None = None
     finish_reason: str | None = None
     response: httpx.Response | None = None
     attempts_used = 0
-    with httpx.Client(timeout=timeout_seconds) as client:
-        for attempt in range(max_retries + 1):
-            accumulator = SseStreamAccumulator()
-            try:
-                if use_stream:
-                    content, finish_reason = stream_chat_completion(
-                        client,
-                        endpoint,
-                        headers,
-                        {**payload, "stream": True},
-                        accumulator=accumulator,
-                        stage_label=stage_label,
-                        progress_interval_seconds=effective_interval,
-                        reporter=progress_reporter,
-                    )
-                else:
-                    with llm_wait_heartbeat(
-                        stage_label,
-                        interval_seconds=effective_interval,
-                        reporter=progress_reporter,
-                    ):
-                        response = client.post(
+    request_ok = False
+    try:
+        with httpx.Client(timeout=timeout_seconds) as client:
+            for attempt in range(max_retries + 1):
+                accumulator = SseStreamAccumulator()
+                try:
+                    if use_stream:
+                        content, finish_reason = stream_chat_completion(
+                            client,
                             endpoint,
-                            headers=headers,
-                            json=payload,
+                            headers,
+                            {**payload, "stream": True},
+                            accumulator=accumulator,
+                            stage_label=stage_label,
+                            progress_interval_seconds=effective_interval,
+                            reporter=reporter,
+                            progress_token=progress_token,
                         )
-                    response.raise_for_status()
-            except httpx.HTTPStatusError as error:
-                if progress_reporter is not None:
-                    progress_reporter.end()
-                status_code = error.response.status_code
-                if not is_retryable_llm_status(status_code) or attempt == max_retries:
-                    detail = error.response.text[:1_000]
-                    message = format_llm_http_error(
-                        base_url=base_url,
-                        status_code=status_code,
-                        detail=detail,
+                    else:
+                        with llm_wait_heartbeat(
+                            stage_label,
+                            interval_seconds=effective_interval,
+                            on_wait=lambda _elapsed: note_progress("仍在生成"),
+                        ):
+                            response = client.post(
+                                endpoint,
+                                headers=headers,
+                                json=payload,
+                            )
+                        response.raise_for_status()
+                except httpx.HTTPStatusError as error:
+                    status_code = error.response.status_code
+                    if not is_retryable_llm_status(status_code) or attempt == max_retries:
+                        detail = error.response.text[:1_000]
+                        message = format_llm_http_error(
+                            base_url=base_url,
+                            status_code=status_code,
+                            detail=detail,
+                        )
+                        raise RuntimeError(message + retries_exhausted_suffix(max_retries)) from error
+                    wait_before_llm_retry(
+                        error,
+                        retry_number=attempt + 1,
+                        max_retries=max_retries,
+                        initial_delay_seconds=retry_delay_seconds,
+                        emit=emit,
                     )
-                    raise RuntimeError(message + retries_exhausted_suffix(max_retries)) from error
-                wait_before_llm_retry(
-                    error,
-                    retry_number=attempt + 1,
-                    max_retries=max_retries,
-                    initial_delay_seconds=retry_delay_seconds,
-                )
-            except httpx.TransportError as error:
-                if progress_reporter is not None:
-                    progress_reporter.end()
-                partial_detail = (
-                    f"；流式已接收 {accumulator.received_characters:,} 字后中断"
-                    if use_stream and accumulator.received_characters
-                    else ""
-                )
-                if attempt == max_retries:
-                    raise RuntimeError(
-                        f"无法连接大模型服务：{error}{partial_detail}"
-                        f"{retries_exhausted_suffix(max_retries)}"
-                    ) from error
-                wait_before_llm_retry(
-                    error,
-                    retry_number=attempt + 1,
-                    max_retries=max_retries,
-                    initial_delay_seconds=retry_delay_seconds,
-                    detail=partial_detail,
-                )
-            else:
-                attempts_used = attempt + 1
-                break
+                    note_progress(f"第 {attempt + 2}/{max_retries + 1} 次尝试中")
+                except httpx.TransportError as error:
+                    partial_detail = (
+                        f"；流式已接收 {accumulator.received_characters:,} 字后中断"
+                        if use_stream and accumulator.received_characters
+                        else ""
+                    )
+                    if attempt == max_retries:
+                        raise RuntimeError(
+                            f"无法连接大模型服务：{error}{partial_detail}"
+                            f"{retries_exhausted_suffix(max_retries)}"
+                        ) from error
+                    wait_before_llm_retry(
+                        error,
+                        retry_number=attempt + 1,
+                        max_retries=max_retries,
+                        initial_delay_seconds=retry_delay_seconds,
+                        detail=partial_detail,
+                        emit=emit,
+                    )
+                    note_progress(f"第 {attempt + 2}/{max_retries + 1} 次尝试中")
+                else:
+                    attempts_used = attempt + 1
+                    break
+        request_ok = True
+    finally:
+        if reporter is not None and progress_token is not None:
+            reporter.finish(progress_token, ok=request_ok)
 
-    if progress_reporter is not None:
-        progress_reporter.end()
     if use_stream:
         if not content:
             raise RuntimeError("大模型响应中没有可用的文本内容；流式响应未产生增量文本")
@@ -1046,10 +1024,9 @@ def request_portraits(
 
     if stage_label:
         elapsed_seconds = time.monotonic() - request_started
-        print(
+        emit(
             f"{stage_label}：大模型响应完成"
-            f"（耗时 {format_elapsed_seconds(elapsed_seconds)}，输出 {len(content):,} 字）",
-            flush=True,
+            f"（耗时 {format_elapsed_seconds(elapsed_seconds)}，输出 {len(content):,} 字）"
         )
     if attempt_counter is not None:
         attempt_counter.append(attempts_used)
@@ -1073,6 +1050,7 @@ def analyze_member_batch(
     contexts: dict[str, str] | None = None,
     max_input_characters: int | None = None,
     stage_label: str | None = None,
+    reporter: LlmProgressReporter | None = None,
 ) -> str:
     """Analyze one batch, retry incomplete members, and skip unrecoverable ones."""
 
@@ -1088,6 +1066,7 @@ def analyze_member_batch(
         max_retries=max_retries,
         retry_delay_seconds=retry_delay_seconds,
         stage_label=stage_label,
+        reporter=reporter,
     )
     missing_members = [
         member for member, _ in member_batch if not has_member_heading(analysis, member)
@@ -1121,12 +1100,18 @@ def analyze_member_batch(
             max_retries=max_retries,
             retry_delay_seconds=retry_delay_seconds,
             stage_label=recovery_label,
+            reporter=reporter,
         )
         if recovered_reason == "length" or not has_member_heading(recovered, member):
-            print(
-                f"警告：群员 {member} 的画像仍不完整，已跳过并继续处理其他成员。",
-                flush=True,
-            )
+            if reporter is not None:
+                reporter.print(
+                    f"警告：群员 {member} 的画像仍不完整，已跳过并继续处理其他成员。"
+                )
+            else:
+                print(
+                    f"警告：群员 {member} 的画像仍不完整，已跳过并继续处理其他成员。",
+                    flush=True,
+                )
             if skipped_members is not None:
                 skipped_members.append(member)
             continue
@@ -1148,6 +1133,7 @@ def analyze_featured_quotes(
     timeout_seconds: float,
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
+    reporter: LlmProgressReporter | None = None,
 ) -> str:
     """Select the strongest humorous or provocative quotes from the full transcript."""
 
@@ -1161,6 +1147,7 @@ def analyze_featured_quotes(
         max_retries=max_retries,
         retry_delay_seconds=retry_delay_seconds,
         stage_label="语录精选",
+        reporter=reporter,
     )
     if finish_reason == "length":
         raise RuntimeError("精选语录输出被截断；请提高 LLM_MAX_TOKENS 后重试")
@@ -1177,6 +1164,7 @@ def analyze_group_overview(
     timeout_seconds: float,
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
+    reporter: LlmProgressReporter | None = None,
 ) -> str:
     """Generate the interpretive portion of the report overview."""
 
@@ -1190,6 +1178,7 @@ def analyze_group_overview(
         max_retries=max_retries,
         retry_delay_seconds=retry_delay_seconds,
         stage_label="群像速览",
+        reporter=reporter,
     )
     if finish_reason == "length":
         raise RuntimeError("群像速览输出被截断；请提高 LLM_MAX_TOKENS 后重试")
@@ -1215,6 +1204,7 @@ def analyze_all_members(
     quote_count: int = DEFAULT_FEATURED_QUOTE_COUNT,
     max_discussion_topics: int = DEFAULT_MAX_DISCUSSION_TOPICS,
     discussion_concurrency: int = DEFAULT_DISCUSSION_CONCURRENCY,
+    portrait_concurrency: int = 1,
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
 ) -> AnalysisReport:
@@ -1241,92 +1231,40 @@ def analyze_all_members(
         max_input_characters=max_input_characters,
     )
     total_message_count = sum(len(messages) for _, messages in all_members)
-    print(
-        f"符合条件的群员 {len(members)} 位（共 {total_message_count:,} 条消息），"
-        f"将分为 {len(member_batches)} 个批次请求大模型",
-        flush=True,
-    )
-    portraits: list[str] = []
-    skipped_members: list[str] = []
-    for index, member_batch in enumerate(member_batches, 1):
-        message_count = sum(len(messages) for _, messages in member_batch)
-        print(
-            f"正在分析群员批次 {index}/{len(member_batches)}"
-            f"（{len(member_batch)} 人、{message_count} 条消息）",
-            flush=True,
-        )
-        print(f"本批次群员：{format_member_batch_names(member_batch)}", flush=True)
-        contexts = contextual_analysis.build_member_contexts(
-            chronological_messages,
-            tuple(member for member, _ in member_batch),
-            before=context_messages_before,
-            after=context_messages_after,
-            maximum_windows=max_context_windows_per_member,
-            maximum_characters=max_context_characters_per_member,
-        )
-        context_characters = sum(len(text) for text in contexts.values())
-        print(
-            f"已构建 {len(contexts)} 位成员的对话上下文（共 {context_characters:,} 字）",
-            flush=True,
-        )
-        batch_analysis = analyze_member_batch(
-            member_batch,
-            base_url=base_url,
-            model=model,
-            api_key=api_key,
-            max_tokens=max_tokens,
-            timeout_seconds=timeout_seconds,
-            max_retries=max_retries,
-            retry_delay_seconds=retry_delay_seconds,
-            skipped_members=skipped_members,
-            contexts=contexts,
-            max_input_characters=max_input_characters,
-            stage_label=f"画像批次 {index}/{len(member_batches)}",
-        )
-        if batch_analysis:
-            portraits.append(
-                normalize_member_portraits(
-                    batch_analysis,
-                    member_batch,
-                    total_message_count=total_message_count,
-                )
-            )
-    portrait_sections = tuple(portraits)
-    analyzed_members = [
-        member_and_messages
-        for member_and_messages in members
-        if member_and_messages[0] not in skipped_members
-    ]
-    if not analyzed_members:
-        raise RuntimeError("没有成功生成任何群员画像，请检查 LLM_MAX_TOKENS 后重试")
-    overview = analyze_group_overview(
-        portrait_sections,
-        base_url=base_url,
-        model=model,
-        api_key=api_key,
-        max_tokens=max_tokens,
-        timeout_seconds=timeout_seconds,
-        max_retries=max_retries,
-        retry_delay_seconds=retry_delay_seconds,
-    )
-    discussion: discussion_analysis.DiscussionReport | None = None
-    discussion_markdown: str | None = None
-    print(
-        "正在生成讨论纪要：分段识别议题 → 归并重复主题 → 逐题撰写纪要"
-        f"（期间将发起多次大模型请求，独立请求最多 {discussion_concurrency} 个并发）",
-        flush=True,
-    )
+    reporter = create_llm_progress_reporter()
     try:
-        discussion_request_count = 0
-        discussion_request_lock = threading.Lock()
+        print(
+            f"符合条件的群员 {len(members)} 位（共 {total_message_count:,} 条消息），"
+            f"将分为 {len(member_batches)} 个批次请求大模型",
+            flush=True,
+        )
+        def analyze_batch(
+            positioned: tuple[int, tuple[tuple[str, list[str]], ...]],
+        ) -> tuple[str, list[str]]:
+            """Build contexts, request one batch, and normalize its portraits."""
 
-        def request_discussion(prompt: str) -> str:
-            nonlocal discussion_request_count
-            with discussion_request_lock:
-                discussion_request_count += 1
-                stage_label = f"讨论纪要（第 {discussion_request_count} 次请求）"
-            response, finish_reason = request_portraits(
-                prompt,
+            index, member_batch = positioned
+            message_count = sum(len(messages) for _, messages in member_batch)
+            reporter.print(
+                f"正在分析群员批次 {index}/{len(member_batches)}"
+                f"（{len(member_batch)} 人、{message_count} 条消息）"
+            )
+            reporter.print(f"本批次群员：{format_member_batch_names(member_batch)}")
+            contexts = contextual_analysis.build_member_contexts(
+                chronological_messages,
+                tuple(member for member, _ in member_batch),
+                before=context_messages_before,
+                after=context_messages_after,
+                maximum_windows=max_context_windows_per_member,
+                maximum_characters=max_context_characters_per_member,
+            )
+            context_characters = sum(len(text) for text in contexts.values())
+            reporter.print(
+                f"已构建 {len(contexts)} 位成员的对话上下文（共 {context_characters:,} 字）"
+            )
+            batch_skipped: list[str] = []
+            batch_analysis = analyze_member_batch(
+                member_batch,
                 base_url=base_url,
                 model=model,
                 api_key=api_key,
@@ -1334,51 +1272,127 @@ def analyze_all_members(
                 timeout_seconds=timeout_seconds,
                 max_retries=max_retries,
                 retry_delay_seconds=retry_delay_seconds,
-                stage_label=stage_label,
+                skipped_members=batch_skipped,
+                contexts=contexts,
+                max_input_characters=max_input_characters,
+                stage_label=f"画像批次 {index}/{len(member_batches)}",
+                reporter=reporter,
             )
-            if finish_reason == "length":
-                raise RuntimeError("讨论纪要输出被截断；请提高 LLM_MAX_TOKENS 后重试")
-            if finish_reason == "content_filter":
-                raise RuntimeError(
-                    "响应被服务端内容审查拦截（finish_reason=content_filter）"
-                )
-            return response
+            if not batch_analysis:
+                return "", batch_skipped
+            normalized = normalize_member_portraits(
+                batch_analysis,
+                member_batch,
+                total_message_count=total_message_count,
+            )
+            return normalized, batch_skipped
 
-        discussion = discussion_analysis.analyze_discussion_minutes(
-            chronological_messages,
-            maximum_topics=max_discussion_topics,
-            maximum_input_characters=max_input_characters,
-            request_text=request_discussion,
-            maximum_workers=discussion_concurrency,
+        if portrait_concurrency > 1 and len(member_batches) > 1:
+            reporter.print(
+                f"画像批次将并发请求大模型（独立批次最多 {portrait_concurrency} 个并发）"
+            )
+        portraits: list[str] = []
+        skipped_members: list[str] = []
+        for normalized, batch_skipped in run_items(
+            tuple(enumerate(member_batches, 1)),
+            worker=analyze_batch,
+            maximum_workers=portrait_concurrency,
+        ):
+            if normalized:
+                portraits.append(normalized)
+            skipped_members.extend(batch_skipped)
+        portrait_sections = tuple(portraits)
+        analyzed_members = [
+            member_and_messages
+            for member_and_messages in members
+            if member_and_messages[0] not in skipped_members
+        ]
+        if not analyzed_members:
+            raise RuntimeError("没有成功生成任何群员画像，请检查 LLM_MAX_TOKENS 后重试")
+        overview = analyze_group_overview(
+            portrait_sections,
+            base_url=base_url,
+            model=model,
+            api_key=api_key,
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            retry_delay_seconds=retry_delay_seconds,
+            reporter=reporter,
         )
-        discussion_markdown = discussion.to_markdown()
-    except RuntimeError as error:
-        print(f"警告：讨论纪要生成失败，已继续生成主报告：{error}", flush=True)
-        discussion_markdown = "## 纪要\n\n纪要暂不可用。"
-    featured_quotes = analyze_featured_quotes(
-        transcript,
-        quote_count=quote_count,
-        base_url=base_url,
-        model=model,
-        api_key=api_key,
-        max_tokens=max_tokens,
-        timeout_seconds=timeout_seconds,
-        max_retries=max_retries,
-        retry_delay_seconds=retry_delay_seconds,
-    )
-    return AnalysisReport(
-        build_analysis_document(
-        member_count=len(analyzed_members),
-        portraits=portrait_sections,
-        overview=overview,
-        top_member=analyzed_members[0],
-        total_message_count=total_message_count,
-        primary_activity_period=build_group_activity_period(analyzed_members),
-        discussion_minutes=discussion_markdown,
-        featured_quotes=featured_quotes,
-        ),
-        discussion,
-    )
+        discussion: discussion_analysis.DiscussionReport | None = None
+        discussion_markdown: str | None = None
+        reporter.print(
+            "正在生成讨论纪要：分段识别议题 → 归并重复主题 → 逐题撰写纪要"
+            f"（期间将发起多次大模型请求，独立请求最多 {discussion_concurrency} 个并发）"
+        )
+        try:
+            discussion_request_count = 0
+            discussion_request_lock = threading.Lock()
+
+            def request_discussion(prompt: str) -> str:
+                nonlocal discussion_request_count
+                with discussion_request_lock:
+                    discussion_request_count += 1
+                    stage_label = f"讨论纪要（第 {discussion_request_count} 次请求）"
+                response, finish_reason = request_portraits(
+                    prompt,
+                    base_url=base_url,
+                    model=model,
+                    api_key=api_key,
+                    max_tokens=max_tokens,
+                    timeout_seconds=timeout_seconds,
+                    max_retries=max_retries,
+                    retry_delay_seconds=retry_delay_seconds,
+                    stage_label=stage_label,
+                    reporter=reporter,
+                )
+                if finish_reason == "length":
+                    raise RuntimeError("讨论纪要输出被截断；请提高 LLM_MAX_TOKENS 后重试")
+                if finish_reason == "content_filter":
+                    raise RuntimeError(
+                        "响应被服务端内容审查拦截（finish_reason=content_filter）"
+                    )
+                return response
+
+            discussion = discussion_analysis.analyze_discussion_minutes(
+                chronological_messages,
+                maximum_topics=max_discussion_topics,
+                maximum_input_characters=max_input_characters,
+                request_text=request_discussion,
+                maximum_workers=discussion_concurrency,
+            )
+            discussion_markdown = discussion.to_markdown()
+        except RuntimeError as error:
+            reporter.print(f"警告：讨论纪要生成失败，已继续生成主报告：{error}")
+            discussion_markdown = "## 纪要\n\n纪要暂不可用。"
+        featured_quotes = analyze_featured_quotes(
+            transcript,
+            quote_count=quote_count,
+            base_url=base_url,
+            model=model,
+            api_key=api_key,
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            retry_delay_seconds=retry_delay_seconds,
+            reporter=reporter,
+        )
+        return AnalysisReport(
+            build_analysis_document(
+            member_count=len(analyzed_members),
+            portraits=portrait_sections,
+            overview=overview,
+            top_member=analyzed_members[0],
+            total_message_count=total_message_count,
+            primary_activity_period=build_group_activity_period(analyzed_members),
+            discussion_minutes=discussion_markdown,
+            featured_quotes=featured_quotes,
+            ),
+            discussion,
+        )
+    finally:
+        reporter.close()
 
 
 def build_analysis_document(
@@ -1834,6 +1848,9 @@ def main() -> None:
         discussion_concurrency = positive_integer_setting(
             "LLM_DISCUSSION_CONCURRENCY", DEFAULT_DISCUSSION_CONCURRENCY
         )
+        portrait_concurrency = positive_integer_setting(
+            "LLM_PORTRAIT_CONCURRENCY", DEFAULT_PORTRAIT_CONCURRENCY
+        )
         if not args.input_markdown.is_file():
             raise FileNotFoundError(f"消息记录文件不存在：{args.input_markdown}")
         model = required_setting("LLM_MODEL")
@@ -1882,6 +1899,7 @@ def main() -> None:
             quote_count=args.quote_count,
             max_discussion_topics=max_discussion_topics,
             discussion_concurrency=discussion_concurrency,
+            portrait_concurrency=portrait_concurrency,
         )
         analysis_markdown, discussion = unpack_analysis_report(analysis)
         output_path.parent.mkdir(parents=True, exist_ok=True)

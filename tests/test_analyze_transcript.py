@@ -18,6 +18,7 @@ import httpx
 
 from src.qqstalker_cli import (
     analyze_transcript,
+    concurrency,
     contextual_analysis,
     discussion_analysis,
 )
@@ -558,35 +559,41 @@ class FakeTerminal(StringIO):
         return True
 
 
-class LiveProgressLineTests(unittest.TestCase):
-    def test_refreshes_in_place_on_interactive_terminals(self) -> None:
-        """Terminal frames must redraw one line via CR + ANSI erase."""
+class RecordingReporter:
+    """A reporter double recording the progress protocol calls in order."""
 
-        terminal = FakeTerminal()
-        with redirect_stdout(terminal):
-            live = analyze_transcript.LiveProgressLine()
-            self.assertTrue(live.refresh_mode)
-            live.refresh("第一帧")
-            live.refresh("第二帧更长")
-            live.end()
+    def __init__(self) -> None:
+        self.events: list[tuple[object, ...]] = []
+        self.messages: list[str] = []
 
-        rendered = terminal.getvalue()
-        self.assertIn("\r\x1b[2K第一帧", rendered)
-        self.assertIn("\r\x1b[2K第二帧更长", rendered)
-        self.assertTrue(rendered.endswith("\n"))
+    def begin(self, label: str) -> object:
+        token = f"token-{len(self.events)}"
+        self.events.append(("begin", token, label))
+        return token
 
-    def test_accumulates_lines_when_output_is_redirected(self) -> None:
-        """Redirected output must stay plain text without control characters."""
+    def update(
+        self,
+        token: object,
+        *,
+        received_chars: int = 0,
+        note: str | None = None,
+    ) -> None:
+        self.events.append(("update", token, received_chars, note))
 
-        output = StringIO()
-        with redirect_stdout(output):
-            live = analyze_transcript.LiveProgressLine()
-            self.assertFalse(live.refresh_mode)
-            live.refresh("第一帧")
-            live.refresh("第二帧")
-            live.end()
+    def finish(self, token: object, *, ok: bool = True) -> None:
+        self.events.append(("finish", token, ok))
 
-        self.assertEqual(output.getvalue(), "第一帧\n第二帧\n")
+    def print(self, text: str) -> None:
+        self.messages.append(text)
+
+    def close(self) -> None:
+        return None
+
+    def __enter__(self) -> "RecordingReporter":
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        return None
 
 
 class StreamingTransportTests(unittest.TestCase):
@@ -632,9 +639,11 @@ class StreamingTransportTests(unittest.TestCase):
         self.assertEqual(client.stream.call_count, 1)
         self.assertEqual(client.post.call_count, 0)
         self.assertIn("正在请求大模型（流式，输入 4 字", progress_text)
-        self.assertIn("大模型正在生成，已接收 ", progress_text)
         self.assertIn("大模型响应完成", progress_text)
         self.assertIn("输出 10 字", progress_text)
+        self.assertNotIn("大模型正在生成", progress_text)
+        self.assertNotIn("\r", progress_text)
+        self.assertNotIn("\x1b[", progress_text)
 
     def test_mid_stream_disconnect_retries_and_keeps_full_result(self) -> None:
         request = httpx.Request("POST", "https://example.test/chat/completions")
@@ -739,17 +748,16 @@ class StreamingTransportTests(unittest.TestCase):
             self.assertEqual(client.stream.call_count, 1)
             self.assertEqual(client.post.call_count, 0)
 
-    def test_streaming_refreshes_a_single_line_on_a_terminal(self) -> None:
-        """On terminals the progress must redraw in place and end before logs."""
+    def test_streaming_reports_progress_through_the_reporter(self) -> None:
+        """The reporter must receive the begin/update/finish sequence in order."""
 
-        terminal = FakeTerminal()
+        reporter = RecordingReporter()
         with (
             patch.object(analyze_transcript.httpx, "Client") as client_class,
             patch.object(
                 analyze_transcript.time, "monotonic", side_effect=itertools.count(0, 8)
             ),
             patch.dict(os.environ, {"LLM_STREAM": "1"}),
-            redirect_stdout(terminal),
         ):
             client = client_class.return_value.__enter__.return_value
             client.stream.return_value = make_stream_context(self.STREAM_LINES)
@@ -762,22 +770,62 @@ class StreamingTransportTests(unittest.TestCase):
                 timeout_seconds=1,
                 stage_label="画像批次 1/1",
                 progress_interval_seconds=15,
+                reporter=reporter,
             )
 
-        rendered = terminal.getvalue()
-        self.assertEqual(rendered.count("\x1b[2K"), 4)
-        self.assertIn("已接收 10 字", rendered)
-        self.assertIn("已等待", rendered)
-        self.assertIn("\n画像批次 1/1：大模型响应完成", rendered)
+        tokens = [event[1] for event in reporter.events if event[0] == "begin"]
+        self.assertEqual(len(tokens), 1)
+        token = tokens[0]
+        self.assertEqual(reporter.events[0], ("begin", token, "画像批次 1/1"))
+        updates = [event for event in reporter.events if event[0] == "update"]
+        self.assertEqual(len(updates), 4)
+        self.assertEqual(updates[-1][2], 10)
+        self.assertEqual(reporter.events[-1], ("finish", token, True))
+        self.assertIn("画像批次 1/1：大模型响应完成", "\n".join(reporter.messages))
 
-    def test_heartbeat_uses_the_reporter_when_provided(self) -> None:
-        """The non-stream heartbeat must render through the same line manager."""
+    def test_reporter_failure_marks_the_row_as_failed(self) -> None:
+        """An unrecoverable request must finish with ok=False on the reporter."""
+
+        reporter = RecordingReporter()
+        with (
+            patch.object(analyze_transcript.httpx, "Client") as client_class,
+            patch.dict(os.environ, {"LLM_STREAM": "1"}),
+        ):
+            client = client_class.return_value.__enter__.return_value
+            client.stream.side_effect = httpx.ConnectError("连接失败")
+            with self.assertRaisesRegex(RuntimeError, "无法连接大模型服务"):
+                analyze_transcript.request_portraits(
+                    "测试请求",
+                    base_url="https://example.test",
+                    model="test-model",
+                    api_key="test-key",
+                    max_tokens=100,
+                    timeout_seconds=1,
+                    max_retries=0,
+                    stage_label="画像批次 1/1",
+                    reporter=reporter,
+                )
+
+        self.assertEqual(reporter.events[-1], ("finish", reporter.events[0][1], False))
+
+    def test_heartbeat_reports_through_the_on_wait_callback(self) -> None:
+        """The non-stream heartbeat must deliver elapsed seconds to the callback."""
+
+        waits: list[float] = []
+        with analyze_transcript.llm_wait_heartbeat(
+            "画像批次 1/1", interval_seconds=0.01, on_wait=waits.append
+        ):
+            time.sleep(0.05)
+
+        self.assertGreaterEqual(len(waits), 1)
+
+    def test_heartbeat_prints_lines_without_a_callback(self) -> None:
+        """Without a reporter the heartbeat must keep printing elapsed lines."""
 
         output = StringIO()
         with redirect_stdout(output):
-            reporter = analyze_transcript.LiveProgressLine()
             with analyze_transcript.llm_wait_heartbeat(
-                "画像批次 1/1", interval_seconds=0.01, reporter=reporter
+                "画像批次 1/1", interval_seconds=0.01
             ):
                 time.sleep(0.05)
 
@@ -860,6 +908,237 @@ class MemberBatchRecoveryTests(unittest.TestCase):
 
         self.assertIn("**分析成员**：1 位", analysis.markdown)
         self.assertNotIn("**分析成员**：2 位", analysis.markdown)
+
+
+class PortraitBatchConcurrencyTests(unittest.TestCase):
+    """Parallel portrait batches must stay ordered, bounded, and complete."""
+
+    @staticmethod
+    def _transcript(members: tuple[str, ...]) -> str:
+        blocks = []
+        for member_index, member in enumerate(members):
+            for offset in range(2):
+                blocks.append(
+                    f"## 2026-09-11 19:0{member_index}:{offset:02d} · 测试群\n\n"
+                    f"> **{member}**\n>\n> 消息{offset}"
+                )
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _member_from_prompt(prompt: str) -> str | None:
+        match = re.search(r"(?m)^- (\S+)（本批次", prompt)
+        return match.group(1) if match else None
+
+    def test_portrait_concurrency_defaults_and_rejects_invalid_values(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                analyze_transcript.positive_integer_setting(
+                    "LLM_PORTRAIT_CONCURRENCY",
+                    analyze_transcript.DEFAULT_PORTRAIT_CONCURRENCY,
+                ),
+                2,
+            )
+        for value in ("0", "-1", "many"):
+            with patch.dict(
+                os.environ, {"LLM_PORTRAIT_CONCURRENCY": value}, clear=False
+            ), self.assertRaisesRegex(RuntimeError, "LLM_PORTRAIT_CONCURRENCY"):
+                analyze_transcript.positive_integer_setting(
+                    "LLM_PORTRAIT_CONCURRENCY", 2
+                )
+
+    def test_parallel_batches_preserve_order_and_bound_concurrency(self) -> None:
+        """Four batches at concurrency 2 must never exceed two in-flight requests."""
+
+        transcript = self._transcript(("甲", "乙", "丙", "丁"))
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def fake_request(prompt: str, **_kwargs: object) -> tuple[str, str | None]:
+            nonlocal active, peak
+            member = self._member_from_prompt(prompt)
+            if member is not None:
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                time.sleep(0.05)
+                with lock:
+                    active -= 1
+                return f"### {member}\n- **角色定位**：测试标签", None
+            if "群像速览" in prompt:
+                return "- **整体画像**：测试概括。", None
+            return "", None
+
+        with patch.object(
+            analyze_transcript, "request_portraits", side_effect=fake_request
+        ), patch.object(
+            analyze_transcript.discussion_analysis,
+            "analyze_discussion_minutes",
+            return_value=discussion_analysis.DiscussionReport((), (), (), "day"),
+        ), patch.object(
+            analyze_transcript, "analyze_featured_quotes", return_value="暂无。"
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                analysis = analyze_transcript.analyze_all_members(
+                    transcript,
+                    base_url="https://example.test",
+                    model="test-model",
+                    api_key="test-key",
+                    max_tokens=100,
+                    timeout_seconds=1,
+                    members_per_request=1,
+                    max_input_characters=1_000,
+                    top_members=None,
+                    min_message_count=0,
+                    portrait_concurrency=2,
+                )
+
+        self.assertEqual(peak, 2)
+        markdown = analysis.markdown
+        positions = [markdown.index(f"### {member}") for member in ("甲", "乙", "丙", "丁")]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("**分析成员**：4 位", markdown)
+        self.assertIn("画像批次将并发请求大模型（独立批次最多 2 个并发）", output.getvalue())
+
+    def test_single_batch_at_default_concurrency_stays_sequential(self) -> None:
+        """One batch must not trigger the parallel notice or a thread pool."""
+
+        transcript = self._transcript(("甲", "乙"))
+
+        def fake_request(prompt: str, **_kwargs: object) -> tuple[str, str | None]:
+            member = self._member_from_prompt(prompt)
+            if member is not None:
+                return f"### {member}\n- **角色定位**：测试标签", None
+            if "群像速览" in prompt:
+                return "- **整体画像**：测试概括。", None
+            return "", None
+
+        with patch.object(
+            analyze_transcript, "request_portraits", side_effect=fake_request
+        ), patch.object(
+            analyze_transcript.discussion_analysis,
+            "analyze_discussion_minutes",
+            return_value=discussion_analysis.DiscussionReport((), (), (), "day"),
+        ), patch.object(
+            analyze_transcript, "analyze_featured_quotes", return_value="暂无。"
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                analyze_transcript.analyze_all_members(
+                    transcript,
+                    base_url="https://example.test",
+                    model="test-model",
+                    api_key="test-key",
+                    max_tokens=100,
+                    timeout_seconds=1,
+                    members_per_request=2,
+                    max_input_characters=1_000,
+                    top_members=None,
+                    min_message_count=0,
+                )
+
+        self.assertNotIn("画像批次将并发请求大模型", output.getvalue())
+
+    def test_skipped_members_survive_parallel_batches(self) -> None:
+        """Members skipped in different parallel batches must all be recorded."""
+
+        transcript = self._transcript(("甲", "乙", "丙", "丁"))
+        failure_names = {"乙", "丁"}
+        request_counts: dict[str, int] = {}
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def fake_request(prompt: str, **_kwargs: object) -> tuple[str, str | None]:
+            nonlocal active, peak
+            member = self._member_from_prompt(prompt)
+            if member is not None:
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                    request_counts[member] = request_counts.get(member, 0) + 1
+                time.sleep(0.02)
+                with lock:
+                    active -= 1
+                attempt = request_counts[member]
+                if member in failure_names:
+                    # 批次请求缺少成员标题触发补偿，补偿请求再次截断则跳过。
+                    if attempt == 1:
+                        return "与本批次成员无关的说明文字", None
+                    return "", "length"
+                return f"### {member}\n- **角色定位**：测试标签", None
+            if "群像速览" in prompt:
+                return "- **整体画像**：测试概括。", None
+            return "", None
+
+        with patch.object(
+            analyze_transcript, "request_portraits", side_effect=fake_request
+        ), patch.object(
+            analyze_transcript.discussion_analysis,
+            "analyze_discussion_minutes",
+            return_value=discussion_analysis.DiscussionReport((), (), (), "day"),
+        ), patch.object(
+            analyze_transcript, "analyze_featured_quotes", return_value="暂无。"
+        ):
+            analysis = analyze_transcript.analyze_all_members(
+                transcript,
+                base_url="https://example.test",
+                model="test-model",
+                api_key="test-key",
+                max_tokens=100,
+                timeout_seconds=1,
+                members_per_request=1,
+                max_input_characters=1_000,
+                top_members=None,
+                min_message_count=0,
+                portrait_concurrency=2,
+            )
+
+        self.assertEqual(peak, 2)
+        markdown = analysis.markdown
+        self.assertIn("### 甲", markdown)
+        self.assertIn("### 丙", markdown)
+        self.assertNotIn("### 乙", markdown)
+        self.assertNotIn("### 丁", markdown)
+        self.assertIn("**分析成员**：2 位", markdown)
+        self.assertEqual(request_counts["乙"], 2)
+        self.assertEqual(request_counts["丁"], 2)
+
+
+class ConcurrentProgressIntegrationTests(unittest.TestCase):
+    def test_concurrent_requests_hold_rows_simultaneously(self) -> None:
+        """Concurrent discussion requests must share one multi-row progress area."""
+
+        reporter = RecordingReporter()
+        barrier = threading.Barrier(4)
+        peak_open_rows = 0
+        open_rows = 0
+        lock = threading.Lock()
+
+        def worker(item: int) -> int:
+            nonlocal peak_open_rows, open_rows
+            token = reporter.begin(f"讨论纪要（第 {item} 次请求）")
+            with lock:
+                open_rows += 1
+                peak_open_rows = max(peak_open_rows, open_rows)
+            barrier.wait(timeout=5)
+            reporter.update(token, received_chars=10)
+            reporter.finish(token, ok=True)
+            with lock:
+                open_rows -= 1
+            return item
+
+        results = concurrency.run_items(
+            (1, 2, 3, 4), worker=worker, maximum_workers=4
+        )
+
+        self.assertEqual(results, (1, 2, 3, 4))
+        self.assertEqual(peak_open_rows, 4)
+        begins = [event for event in reporter.events if event[0] == "begin"]
+        finishes = [event for event in reporter.events if event[0] == "finish"]
+        self.assertEqual(len(begins), 4)
+        self.assertTrue(all(event[2] is True for event in finishes))
 
 
 class DiscussionMinutesTests(unittest.TestCase):

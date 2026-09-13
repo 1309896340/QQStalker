@@ -45,6 +45,10 @@ def generate_portrait(
         "LLM_MAX_DISCUSSION_TOPICS",
         analyze_transcript.DEFAULT_MAX_DISCUSSION_TOPICS,
     )
+    portrait_concurrency = analyze_transcript.positive_integer_setting(
+        "LLM_PORTRAIT_CONCURRENCY",
+        analyze_transcript.DEFAULT_PORTRAIT_CONCURRENCY,
+    )
 
     with tempfile.TemporaryDirectory(prefix="qqstalker-portrait-") as temporary_directory:
         temporary_dir = Path(temporary_directory)
@@ -123,6 +127,7 @@ def generate_portrait(
             ),
             quote_count=quote_count,
             max_discussion_topics=max_discussion_topics,
+            portrait_concurrency=portrait_concurrency,
         )
         generated_at = datetime.now()
         html_path = analyze_transcript.resolve_output_path(
