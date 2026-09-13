@@ -11,3 +11,8 @@
 
 - [x] 3.1 补充 `tests/test_analyze_transcript.py` 用例：标记合法转换、非法标记剥壳、别名与规范名同色、词边界、`appeared` 别名判定。验证：`uv run pytest tests/test_analyze_transcript.py`
 - [x] 3.2 回归验证：`uv run pyright` 与 `uv run python -m compileall -q src` 全部通过
+
+## 4. 特殊字符成员名修复（生成报告后追加）
+
+- [x] 4.1 包裹粗体前对姓名内 Markdown/HTML 特殊字符转义（`&`、`<`、`>` 实体转义，`` \ ` * _ [ ] ( ) # ! `` 反斜杠转义），词边界类扩展 `[A-Za-z0-9_]`，`appeared` 判定改用转义后形式。验证：单测覆盖 `*new LS_Hower`、`_` 成员名，并用 python-markdown 渲染确认配对完整
+- [x] 4.2 `_normalize_minutes_text` 剥除全部星号残留；`_minutes_instruction` 补充纯文本要求（除 `<<完整署名>>` 外不得输出任何标记符号）。验证：单测覆盖单星号剥除与 prompt 文案

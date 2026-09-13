@@ -1744,6 +1744,10 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
         self.assertEqual(discussion_analysis.member_aliases(["祥子(备注)", "祥子"]), {})
         self.assertEqual(discussion_analysis.member_aliases(["祥子", "祥子(备注)"]), {})
+        self.assertEqual(
+            discussion_analysis.member_aliases(["*new LS_Hower", "_"]),
+            {"new LS_Hower": "*new LS_Hower"},
+        )
 
     def test_member_highlights_match_alias_with_same_color(self) -> None:
         moment = datetime(2026, 9, 11, 9, 0)
@@ -1770,7 +1774,58 @@ class DiscussionMinutesTests(unittest.TestCase):
 
         self.assertEqual(styles["祥子"], styles[member])
         self.assertIn("**祥子**提出go语言观点。", highlighted.topics[0].minutes)
-        self.assertIn(f"**{member}**补充细节。", highlighted.topics[0].minutes)
+        self.assertIn(f"**{discussion_analysis.escape_inline_name(member)}**补充细节。", highlighted.topics[0].minutes)
+
+    def test_bold_member_names_escape_markdown_and_html_characters(self) -> None:
+        self.assertEqual(
+            discussion_analysis.bold_member_names("*new LS_Hower发言。", ["*new LS_Hower"]),
+            "**\\*new LS\\_Hower**发言。",
+        )
+        self.assertEqual(
+            discussion_analysis.bold_member_names("由_提出观点。", ["_"]),
+            "由**\\_**提出观点。",
+        )
+        self.assertEqual(
+            discussion_analysis.bold_member_names("<b>老哥</b>发言。", ["<b>老哥"]),
+            "**&lt;b&gt;老哥**</b>发言。",
+        )
+        self.assertEqual(
+            discussion_analysis.bold_member_names("<<*new LS_Hower>>总结。", ["*new LS_Hower"]),
+            "**\\*new LS\\_Hower**总结。",
+        )
+
+    def test_member_highlights_style_names_with_special_characters(self) -> None:
+        moment = datetime(2026, 9, 11, 9, 0)
+        report = discussion_analysis.DiscussionReport(
+            (
+                discussion_analysis.DiscussionTopic(
+                    "t1", "议题", 2, 0, moment, moment, ("*new LS_Hower",),
+                    "*new LS_Hower分享教程。",
+                ),
+            ),
+            (),
+            (),
+            "day",
+        )
+        highlighted = report.with_member_highlights(["*new LS_Hower"])
+
+        self.assertEqual(
+            set(highlighted.member_styles or {}),
+            {"*new LS_Hower", "new LS_Hower"},
+        )
+        self.assertIn(
+            "**\\*new LS\\_Hower**分享教程。", highlighted.topics[0].minutes
+        )
+
+    def test_normalize_minutes_strips_single_asterisks(self) -> None:
+        self.assertEqual(
+            discussion_analysis.normalize_minutes("甲提出观点*强调语气。乙回应*补充。"),
+            "甲提出观点强调语气。乙回应补充。",
+        )
+        self.assertEqual(
+            discussion_analysis.normalize_minutes("<<*new LS_Hower>>提出观点。乙回应。"),
+            "<<*new LS_Hower>>提出观点。乙回应。",
+        )
 
     def test_topic_colors_stay_distinct_beyond_palette(self) -> None:
         palette = discussion_analysis.TOPIC_COLORS
