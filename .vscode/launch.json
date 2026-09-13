@@ -55,17 +55,17 @@
       "request": "launch",
       "module": "src.qqstalker_cli.render_html_png",
       "args": [
-        "${workspaceFolder}/analysis/20260913212300_相亲后吐槽～互相治愈.html",
+        "${workspaceFolder}/analysis/20260914003629_电影迷交流群.html",
         "${workspaceFolder}/analysis/",
         "--dpi",
-        "200",
+        "160",
         "--width-mm",
         "260",
         "--max-height-px",
-        "4800",
+        "4200",
         "--stitch-horizontal",
         "--stitch-count",
-        "4"
+        "2"
       ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
