@@ -110,6 +110,53 @@ class SelectMembersTests(unittest.TestCase):
 
 
 class FeaturedQuotesNormalizationTests(unittest.TestCase):
+    def test_sample_message_blocks_keeps_budget_and_coverage(self) -> None:
+        blocks = [
+            f"## 2026-09-12 0{index // 60}:{index % 60:02d}:00 · 群\n\n> **甲**\n>\n> 消息{index}{'内容' * 40}\n\n"
+            for index in range(100)
+        ]
+        transcript = "# 群聊记录\n\n" + "".join(blocks)
+
+        self.assertEqual(
+            analyze_transcript.sample_message_blocks(transcript, 10**9), transcript
+        )
+        sampled = analyze_transcript.sample_message_blocks(transcript, 2_000)
+        self.assertLessEqual(len(sampled), 2_000)
+        self.assertIn("消息0", sampled)
+        self.assertTrue(any(f"消息{index}" in sampled for index in range(90, 100)))
+        self.assertLess(sampled.count("## 2026-09-12"), 100)
+
+    def test_analyze_featured_quotes_bounds_transcript_input(self) -> None:
+        blocks = [
+            f"## 2026-09-12 0{index // 60}:{index % 60:02d}:00 · 群\n\n> **甲**\n>\n> 消息{index}{'内容' * 40}\n\n"
+            for index in range(100)
+        ]
+        transcript = "# 群聊记录\n\n" + "".join(blocks)
+        captured: list[str] = []
+
+        def fake_request(prompt: str, **_kwargs: object) -> tuple[str, str | None]:
+            captured.append(prompt)
+            return "成员：甲\n语录：消息0\n点评：测试。", None
+
+        with patch.object(
+            analyze_transcript, "request_portraits", side_effect=fake_request
+        ):
+            analyze_transcript.analyze_featured_quotes(
+                transcript,
+                quote_count=5,
+                base_url="https://example.test",
+                model="test-model",
+                api_key="test-key",
+                max_tokens=100,
+                timeout_seconds=1,
+                max_input_characters=2_000,
+            )
+
+        self.assertEqual(len(captured), 1)
+        self.assertLessEqual(len(captured[0]), 2_000)
+        self.assertIn("消息0", captured[0])
+        self.assertTrue(any(f"消息{index}" in captured[0] for index in range(90, 100)))
+
     def test_parses_plain_text_fields_per_member(self) -> None:
         """The requested plain 成员/语录/点评 lines must parse into records."""
 

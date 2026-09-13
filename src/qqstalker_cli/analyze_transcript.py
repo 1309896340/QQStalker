@@ -400,6 +400,27 @@ def build_featured_quotes_prompt(transcript: str, *, quote_count: int) -> str:
 """
 
 
+def sample_message_blocks(transcript: str, maximum_characters: int) -> str:
+    """Evenly sample whole message blocks so a full transcript fits one request."""
+
+    parts = re.split(r"(?m)^(?=## )", transcript)
+    header, blocks = parts[0], parts[1:]
+    if not blocks or len(header) + sum(len(block) for block in blocks) <= maximum_characters:
+        return transcript
+    average = (len(transcript) - len(header)) / len(blocks)
+    keep = max(1, int(maximum_characters // average))
+    indices = sorted(
+        {min(len(blocks) - 1, round(index * len(blocks) / keep)) for index in range(keep)}
+    )
+    chosen = [blocks[index] for index in indices]
+    while (
+        len(chosen) > 1
+        and len(header) + sum(len(block) for block in chosen) > maximum_characters
+    ):
+        chosen.pop()
+    return header + "".join(chosen)
+
+
 FEATURED_MEMBER_LINE_PATTERN = re.compile(r"^成\s*员[：:]\s*(.+)$")
 FEATURED_QUOTE_LINE_PATTERN = re.compile(r"^语\s*录[：:](.*)$")
 FEATURED_PLAIN_COMMENT_PATTERN = re.compile(r"^点\s*评[：:](.*)$")
@@ -1323,15 +1344,29 @@ def analyze_featured_quotes(
     api_key: str,
     max_tokens: int,
     timeout_seconds: float,
+    max_input_characters: int | None = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
     reporter: LlmProgressReporter | None = None,
 ) -> str:
     """Select the strongest humorous or provocative quotes from the full transcript."""
 
+    prompt_transcript = transcript
+    if max_input_characters is not None:
+        overhead = len(build_featured_quotes_prompt("", quote_count=quote_count))
+        budget = max_input_characters - overhead
+        if budget <= 0:
+            raise RuntimeError("LLM_MAX_INPUT_CHARACTERS 小于语录精选请求的固定开销")
+        prompt_transcript = sample_message_blocks(transcript, budget)
+        if prompt_transcript != transcript and reporter is not None:
+            reporter.print(
+                f"提示：完整记录 {len(transcript):,} 字超过语录精选单次输入预算，"
+                f"已均匀采样至 {len(prompt_transcript):,} 字"
+            )
+
     def request(uncapped: bool) -> tuple[str, str | None]:
         return request_portraits(
-            build_featured_quotes_prompt(transcript, quote_count=quote_count),
+            build_featured_quotes_prompt(prompt_transcript, quote_count=quote_count),
             base_url=base_url,
             model=model,
             api_key=api_key,
@@ -1624,6 +1659,7 @@ def analyze_all_members(
             api_key=api_key,
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
+            max_input_characters=max_input_characters,
             max_retries=max_retries,
             retry_delay_seconds=retry_delay_seconds,
             reporter=reporter,
