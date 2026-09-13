@@ -304,7 +304,7 @@ class ProgressReportingTests(unittest.TestCase):
                 ("- **群体氛围**：讨论直接。", None),
                 (
                     '{"topics":[{"id":"t1","title":"测试议题",'
-                    '"summary":"摘要","start_id":0,"end_id":1}]}',
+                    '"summary":"摘要","start_line":1,"end_line":2}]}',
                     None,
                 ),
                 ("甲表达了一个观点并作出总结。乙补充了不同信息并支持继续讨论。", None),
@@ -838,7 +838,7 @@ class MemberBatchRecoveryTests(unittest.TestCase):
                 ("- **群体氛围**：讨论直接。", None),
                 (
                     '{"topics":[{"id":"t1","title":"测试议题",'
-                    '"summary":"摘要","start_id":0,"end_id":1}]}',
+                    '"summary":"摘要","start_line":1,"end_line":2}]}',
                     None,
                 ),
                 ("甲表达了一个观点并作出总结。乙补充了不同信息并支持继续讨论。", None),
@@ -896,53 +896,66 @@ class DiscussionMinutesTests(unittest.TestCase):
         self.assertEqual([item.index for item in effective], [3, 4])
         self.assertEqual([item.content for item in effective], ["文字", "有效讨论"])
 
-    def test_rejects_overlapping_or_incomplete_segment_ranges(self) -> None:
+    def test_segment_line_ranges_normalize_to_full_coverage(self) -> None:
         messages = (
-            discussion_analysis.DiscussionMessage(1, datetime(2026, 9, 11), "甲", "甲说话"),
-            discussion_analysis.DiscussionMessage(2, datetime(2026, 9, 11), "乙", "乙说话"),
-            discussion_analysis.DiscussionMessage(4, datetime(2026, 9, 11), "丙", "丙说话"),
+            discussion_analysis.DiscussionMessage(11, datetime(2026, 9, 11), "甲", "甲说话"),
+            discussion_analysis.DiscussionMessage(17, datetime(2026, 9, 11), "乙", "乙说话"),
+            discussion_analysis.DiscussionMessage(23, datetime(2026, 9, 11), "丙", "丙说话"),
         )
-        with self.assertRaisesRegex(RuntimeError, "重叠"):
+        with self.assertRaisesRegex(RuntimeError, "start_line 必须是整数"):
             discussion_analysis.parse_segment_response(
-                '{"topics":[{"id":"a","title":"甲","summary":"甲","start_id":1,"end_id":2},'
-                '{"id":"b","title":"乙","summary":"乙","start_id":2,"end_id":4}]}',
+                '{"topics":[{"id":"a","title":"甲","summary":"甲","substantive":true,"start_line":"1","end_line":3}]}',
                 expected_messages=messages,
                 namespace="test",
             )
-        with self.assertRaisesRegex(RuntimeError, "完整覆盖"):
+        with self.assertRaisesRegex(RuntimeError, "实质性判定必须是布尔值"):
             discussion_analysis.parse_segment_response(
-                '{"topics":[{"id":"a","title":"甲","summary":"甲","start_id":1,"end_id":2}]}',
-                expected_messages=messages,
-                namespace="test",
-            )
-        with self.assertRaisesRegex(RuntimeError, "message_id"):
-            discussion_analysis.parse_segment_response(
-                '{"topics":[{"id":"a","title":"甲","summary":"甲","start_id":1,"end_id":3}]}',
-                expected_messages=messages,
-                namespace="test",
-            )
-        with self.assertRaisesRegex(RuntimeError, "必须是整数"):
-            discussion_analysis.parse_segment_response(
-                '{"topics":[{"id":"a","title":"甲","summary":"甲","start_id":true,"end_id":4}]}',
+                '{"topics":[{"id":"a","title":"甲","summary":"甲","substantive":"yes","start_line":1,"end_line":3}]}',
                 expected_messages=messages,
                 namespace="test",
             )
         with self.assertRaisesRegex(RuntimeError, "不能重复"):
             discussion_analysis.parse_segment_response(
-                '{"topics":[{"id":"a","title":"甲","summary":"甲","start_id":1,"end_id":2},'
-                '{"id":"a","title":"乙","summary":"乙","start_id":4,"end_id":4}]}',
+                '{"topics":[{"id":"a","title":"甲","summary":"甲","substantive":true,"start_line":1,"end_line":2},'
+                '{"id":"a","title":"乙","summary":"乙","substantive":true,"start_line":3,"end_line":3}]}',
+                expected_messages=messages,
+                namespace="test",
+            )
+        with self.assertRaisesRegex(RuntimeError, "未包含有效区间"):
+            discussion_analysis.parse_segment_response(
+                '{"topics":[{"id":"a","title":"甲","summary":"甲","substantive":true,"start_line":98,"end_line":99}]}',
                 expected_messages=messages,
                 namespace="test",
             )
         topics = discussion_analysis.parse_segment_response(
-            '{"topics":[{"id":"a","title":"甲","summary":"甲","start_id":1,"end_id":2},'
-            '{"id":"b","title":"乙","summary":"乙","start_id":4,"end_id":4}]}',
+            '{"topics":['
+            '{"id":"a","title":"甲","summary":"甲","substantive":true,"start_line":2,"end_line":1},'
+            '{"id":"b","title":"乙","summary":"乙","substantive":false,"start_line":2,"end_line":3},'
+            '{"id":"c","title":"丙","summary":"丙","substantive":true,"start_line":99,"end_line":100}]}',
+            expected_messages=messages,
+            namespace="test",
+        )
+        self.assertEqual([topic.message_indices for topic in topics], [(11, 17, 23)])
+        self.assertEqual([topic.substantive for topic in topics], [True])
+
+        topics = discussion_analysis.parse_segment_response(
+            '{"topics":['
+            '{"id":"a","title":"甲","summary":"甲","substantive":true,"start_line":1,"end_line":1},'
+            '{"id":"b","title":"乙","summary":"乙","substantive":false,"start_line":3,"end_line":3}]}',
             expected_messages=messages,
             namespace="test",
         )
         self.assertEqual(
-            [topic.message_indices for topic in topics], [(1, 2), (4,)]
+            [topic.message_indices for topic in topics], [(11, 17), (23,)]
         )
+        self.assertEqual([topic.substantive for topic in topics], [True, False])
+
+        topics = discussion_analysis.parse_segment_response(
+            '{"topics":[{"id":"a","title":"甲","summary":"甲","substantive":true,"start_line":2,"end_line":2}]}',
+            expected_messages=messages,
+            namespace="test",
+        )
+        self.assertEqual([topic.message_indices for topic in topics], [(11, 17, 23)])
 
     def test_prompt_budget_ranking_and_heat_buckets_are_deterministic(self) -> None:
         timestamp = datetime(2026, 9, 11, 9, 0)
@@ -961,22 +974,55 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
         self.assertTrue(all(len(chunk.prompt) <= 500 for chunk in chunks))
 
-        responses = iter(
-            (
-                '{"topics":[{"id":"a","title":"话题甲","summary":"摘要",'
-                '"start_id":0,"end_id":2}]}',
-                "甲提出主题并支持继续研究。乙补充事实并总结下一步。",
-            )
-        )
+        def scripted_request(prompt: str) -> str:
+            if "候选议题如下" in prompt:
+                payload = prompt.split("候选议题如下：\n", 1)[1]
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "id": "g1",
+                                "title": "话题甲",
+                                "summary": "摘要",
+                                "source_ids": re.findall(r'"id":"([^"]+)"', payload),
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            if "start_line" in prompt:
+                positions = [
+                    int(value) for value in re.findall(r"(?m)^\[(\d+) \|", prompt)
+                ]
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "id": "a",
+                                "title": "话题甲",
+                                "summary": "摘要",
+                                "substantive": True,
+                                "start_line": positions[0],
+                                "end_line": positions[-1],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            return "甲提出主题并支持继续研究。乙补充事实并总结下一步。"
+
         report = discussion_analysis.analyze_discussion_minutes(
             source,
             maximum_topics=5,
             maximum_input_characters=500,
-            request_text=lambda _prompt: next(responses),
+            request_text=scripted_request,
         )
         self.assertEqual([topic.title for topic in report.topics], ["话题甲"])
+        self.assertEqual(report.topics[0].message_count, 3)
         self.assertEqual(report.granularity, "hour")
         self.assertEqual(report.series[0].values, (1, 1, 1))
+        self.assertEqual(report.series[0].color, discussion_analysis.TOPIC_COLORS[0])
+        self.assertEqual(set(report.member_styles or {}), {"甲", "乙"})
 
     def test_discussion_requests_run_concurrently_with_identical_results(self) -> None:
         """Independent discussion requests must run in parallel without changing output."""
@@ -997,6 +1043,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         def scripted_request(prompt: str) -> str:
             seen_threads.add(threading.current_thread().name)
             if "候选议题如下" in prompt:
+                payload = prompt.split("候选议题如下：\n", 1)[1]
                 return json.dumps(
                     {
                         "topics": [
@@ -1004,16 +1051,16 @@ class DiscussionMinutesTests(unittest.TestCase):
                                 "id": "g1",
                                 "title": "统一议题",
                                 "summary": "统一后的摘要",
-                                "source_ids": re.findall(r'"id":"(segment-[^"]+)"', prompt),
+                                "source_ids": re.findall(r'"id":"([^"]+)"', payload),
                             }
                         ]
                     },
                     ensure_ascii=False,
                 )
-            if "start_id" in prompt:
-                ids = sorted(
-                    int(value) for value in re.findall(r"message_id=(\d+)", prompt)
-                )
+            if "start_line" in prompt:
+                positions = [
+                    int(value) for value in re.findall(r"(?m)^\[(\d+) \|", prompt)
+                ]
                 return json.dumps(
                     {
                         "topics": [
@@ -1021,8 +1068,9 @@ class DiscussionMinutesTests(unittest.TestCase):
                                 "id": "t1",
                                 "title": "话题甲",
                                 "summary": "摘要",
-                                "start_id": ids[0],
-                                "end_id": ids[-1],
+                                "substantive": True,
+                                "start_line": positions[0],
+                                "end_line": positions[-1],
                             }
                         ]
                     },
@@ -1041,6 +1089,255 @@ class DiscussionMinutesTests(unittest.TestCase):
         self.assertEqual(len(report.topics), 1)
         self.assertEqual(report.topics[0].message_count, 6)
         self.assertEqual(report.series[0].values, (1,) * 6)
+
+    def test_merge_response_inherits_substantive_from_any_source(self) -> None:
+        sources = (
+            discussion_analysis.TopicCandidate("s:a", "甲题", "摘要", (1,), True),
+            discussion_analysis.TopicCandidate("s:b", "乙题", "摘要", (2,), False),
+            discussion_analysis.TopicCandidate("s:c", "丙题", "摘要", (3,), False),
+        )
+        merged = discussion_analysis.parse_merge_response(
+            '{"topics":[{"id":"g1","title":"合并","summary":"摘要","source_ids":["s:a","s:b"]},'
+            '{"id":"g2","title":"闲聊","summary":"摘要","source_ids":["s:c"]}]}',
+            sources=sources,
+            namespace="test",
+        )
+        self.assertEqual([item.substantive for item in merged], [True, False])
+
+    def test_excludes_unsubstantiated_topics_before_ranking(self) -> None:
+        timestamp = datetime(2026, 9, 11, 9, 0)
+        source = tuple(
+            contextual_analysis.TranscriptMessage(
+                index, timestamp.replace(hour=9 + index), "甲乙"[index % 2], f"消息{index}", ""
+            )
+            for index in range(4)
+        )
+
+        def scripted_request(prompt: str) -> str:
+            if "候选议题如下" in prompt:
+                identifiers = re.findall(r'"id":"(segment-0:[^"]+)"', prompt)
+                a_id = next(item for item in identifiers if item.endswith(":a"))
+                b_id = next(item for item in identifiers if item.endswith(":b"))
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "id": "g1",
+                                "title": "实质议题",
+                                "summary": "摘要",
+                                "source_ids": [a_id],
+                            },
+                            {
+                                "id": "g2",
+                                "title": "闲聊",
+                                "summary": "摘要",
+                                "source_ids": [b_id],
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            if "讨论纪要" in prompt:
+                return "甲提出核心观点并总结方向。乙补充细节并反思结论。"
+            return json.dumps(
+                {
+                    "topics": [
+                        {
+                            "id": "a",
+                            "title": "实质议题",
+                            "summary": "摘要",
+                            "substantive": True,
+                            "start_line": 1,
+                            "end_line": 1,
+                        },
+                        {
+                            "id": "b",
+                            "title": "闲聊",
+                            "summary": "摘要",
+                            "substantive": False,
+                            "start_line": 2,
+                            "end_line": 4,
+                        },
+                    ]
+                },
+                ensure_ascii=False,
+            )
+
+        report = discussion_analysis.analyze_discussion_minutes(
+            source,
+            maximum_topics=5,
+            maximum_input_characters=2000,
+            request_text=scripted_request,
+        )
+        self.assertEqual([topic.title for topic in report.topics], ["实质议题"])
+        self.assertEqual(report.topics[0].message_count, 1)
+        self.assertEqual(len(report.series), 1)
+
+    def test_all_unsubstantiated_topics_yield_empty_report(self) -> None:
+        timestamp = datetime(2026, 9, 11, 9, 0)
+        source = tuple(
+            contextual_analysis.TranscriptMessage(
+                index, timestamp.replace(hour=9 + index), "甲", f"消息{index}", ""
+            )
+            for index in range(2)
+        )
+        calls = iter(range(1))
+
+        def scripted_request(_prompt: str) -> str:
+            next(calls)
+            return json.dumps(
+                {
+                    "topics": [
+                        {
+                            "id": "a",
+                            "title": "闲聊",
+                            "summary": "摘要",
+                            "substantive": False,
+                            "start_line": 1,
+                            "end_line": 2,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+
+        report = discussion_analysis.analyze_discussion_minutes(
+            source,
+            maximum_topics=5,
+            maximum_input_characters=2000,
+            request_text=scripted_request,
+        )
+        self.assertEqual(report.topics, ())
+        self.assertIsNone(report.chart_payload())
+        self.assertEqual(
+            report.to_markdown(), "## 纪要\n\n暂无可总结的有效讨论议题。"
+        )
+
+    def test_minutes_instruction_requires_thematic_concise_paragraph(self) -> None:
+        partial = discussion_analysis._minutes_instruction("议题", partial=True)
+        merged = discussion_analysis._minutes_instruction("议题", partial=False)
+        for instruction in (partial, merged):
+            self.assertIn("200~300", instruction)
+            self.assertIn("核心观点、关键分歧", instruction)
+            self.assertIn("虚构立场关系", instruction)
+            self.assertNotIn("按消息时间顺序", instruction)
+        self.assertIn("压缩归纳为一段最终纪要", merged)
+        self.assertNotIn("压缩归纳为一段最终纪要", partial)
+
+    def test_minutes_length_cap_retries_then_truncates(self) -> None:
+        self.assertEqual(
+            discussion_analysis.normalize_minutes("甲提出观点。**乙**总结。"),
+            "甲提出观点。乙总结。",
+        )
+        self.assertEqual(
+            discussion_analysis.normalize_minutes("甲说了一句话。乙回应一句。"),
+            "甲说了一句话。乙回应一句。",
+        )
+        long_text = "甲提出观点并说明理由。" * 30
+        with self.assertRaisesRegex(RuntimeError, "300"):
+            discussion_analysis.normalize_minutes(long_text)
+        truncated = discussion_analysis.truncate_minutes(long_text)
+        self.assertLessEqual(len(truncated), discussion_analysis.MAX_MINUTES_CHARACTERS)
+        self.assertTrue(truncated.endswith("。"))
+        self.assertEqual(
+            len(discussion_analysis.truncate_minutes("甲" * 400)),
+            discussion_analysis.MAX_MINUTES_CHARACTERS,
+        )
+
+        responses = [long_text, long_text, long_text]
+        result = discussion_analysis._bounded_minutes(
+            "任意提示", request_text=lambda _prompt: responses.pop(0)
+        )
+        self.assertFalse(responses)
+        self.assertLessEqual(len(result), discussion_analysis.MAX_MINUTES_CHARACTERS)
+
+    def test_member_highlights_bold_names_and_assign_distinct_colors(self) -> None:
+        moment = datetime(2026, 9, 11, 9, 0)
+        report = discussion_analysis.DiscussionReport(
+            (
+                discussion_analysis.DiscussionTopic(
+                    "t1", "议题", 2, 0, moment, moment, ("甲", "乙"),
+                    "甲提出核心观点。乙补充细节并总结。",
+                ),
+                discussion_analysis.DiscussionTopic(
+                    "t2", "议题二", 1, 5, moment, moment, ("甲",), "甲再次强调结论。"
+                ),
+            ),
+            (),
+            (),
+            "day",
+        )
+        highlighted = report.with_member_highlights(["甲", "乙", "丙"])
+        styles = highlighted.member_styles or {}
+
+        self.assertEqual(set(styles), {"甲", "乙"})
+        self.assertNotEqual(styles["甲"][0], styles["乙"][0])
+        self.assertIn("**甲**提出核心观点。**乙**补充细节并总结。", highlighted.topics[0].minutes)
+        self.assertEqual(highlighted.topics[1].participants, ("**甲**",))
+        self.assertIn("- **主要参与者**：**甲**、**乙**", highlighted.to_markdown())
+        self.assertIsNone(report.member_styles)
+        self.assertEqual(
+            discussion_analysis.bold_member_names("王小明和小明都在", ["小明", "王小明"]),
+            "**王小明**和**小明**都在",
+        )
+
+    def test_topic_colors_stay_distinct_beyond_palette(self) -> None:
+        palette = discussion_analysis.TOPIC_COLORS
+        self.assertEqual(
+            [discussion_analysis.topic_color(index) for index in range(len(palette))],
+            list(palette),
+        )
+        colors = [discussion_analysis.topic_color(index) for index in range(12)]
+        self.assertEqual(len(set(colors)), 12)
+        self.assertEqual(
+            colors,
+            [discussion_analysis.topic_color(index) for index in range(12)],
+        )
+
+    def test_segment_window_bounds_classification_chunks(self) -> None:
+        """Segment prompts stay in a window where exact id coverage stays reliable."""
+
+        timestamp = datetime(2026, 9, 11, 9, 0)
+        source = tuple(
+            contextual_analysis.TranscriptMessage(
+                index, timestamp, f"成员{index}", f"第{index}条讨论内容" * 10, ""
+            )
+            for index in range(120)
+        )
+        chunks = discussion_analysis.build_segment_prompt_chunks(
+            discussion_analysis.filter_discussion_messages(source),
+            maximum_characters=50_000,
+        )
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(
+            all(
+                len(chunk.prompt) <= discussion_analysis.SEGMENT_WINDOW_CHARACTERS
+                for chunk in chunks
+            )
+        )
+
+    def test_retry_sends_corrective_feedback(self) -> None:
+        """The single retry must tell the model exactly which check failed."""
+
+        prompts: list[str] = []
+        responses = iter(("bad", "good"))
+
+        def parser(response: str) -> str:
+            if response == "bad":
+                raise RuntimeError("start_line 必须是整数")
+            return response
+
+        result = discussion_analysis._validated_request(
+            "原始提示",
+            request_text=lambda prompt: (prompts.append(prompt), next(responses))[1],
+            parser=parser,
+        )
+
+        self.assertEqual(result, "good")
+        self.assertEqual(len(prompts), 2)
+        self.assertTrue(prompts[1].startswith("原始提示"))
+        self.assertIn("start_line 必须是整数", prompts[1])
+        self.assertIn("重新完整输出", prompts[1])
 
     def test_thinking_control_setting_accepts_only_enabled_or_disabled(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -1134,11 +1431,43 @@ class HtmlRenderingTests(unittest.TestCase):
         )
         rendered = analyze_transcript.render_html(markdown, discussion=report)
 
-        self.assertLess(markdown.index("## 讨论纪要"), markdown.index("## 用户画像"))
+        self.assertLess(markdown.index("## 纪要"), markdown.index("## 用户画像"))
+        self.assertNotIn("讨论热度", markdown)
         self.assertIn("echarts@5.5.1", rendered)
         self.assertIn("discussion-topic", rendered)
         self.assertIn("__qqstalkerDiscussionChartState", rendered)
+        self.assertIn("member-name", rendered)
+        self.assertNotIn("discussion-fallback", rendered)
         self.assertIn("activity-bar", rendered)
+
+    def test_member_highlight_styles_reach_payload_and_markdown(self) -> None:
+        base = discussion_analysis.DiscussionReport(
+            (
+                discussion_analysis.DiscussionTopic(
+                    "t1", "测试议题", 2, 0, datetime(2026, 9, 11, 9),
+                    datetime(2026, 9, 11, 10), ("甲", "乙"),
+                    "甲提出核心观点。乙补充信息并作出总结。",
+                ),
+            ),
+            ("09-11 09:00", "09-11 10:00"),
+            (discussion_analysis.HeatSeries("t1", "测试议题", "#0072B2", (1, 1)),),
+            "hour",
+        )
+        report = base.with_member_highlights(["甲", "乙", "丙"])
+        markdown = analyze_transcript.build_analysis_document(
+            member_count=2,
+            portraits=("### 甲\n- **活跃度**：2 条（100%），晚间为主。",),
+            discussion_minutes=report.to_markdown(),
+        )
+        rendered = analyze_transcript.render_html(markdown, discussion=report)
+
+        self.assertIn("**甲**提出核心观点", markdown)
+        self.assertIn("**主要参与者**：**甲**、**乙**", markdown)
+        styles = report.member_styles or {}
+        self.assertEqual(set(styles), {"甲", "乙"})
+        self.assertIn('{"甲": {"color": "hsl(0, 65%, 27%)"', rendered)
+        self.assertIn('"background": "hsl(0, 70%, 90%)"', rendered)
+        self.assertIn("member-name", rendered)
 
     def test_includes_role_and_featured_quote_enhancements(self) -> None:
         """Cards and quote curation receive their own visual hierarchy hooks."""

@@ -1350,7 +1350,7 @@ def analyze_all_members(
         discussion_markdown = discussion.to_markdown()
     except RuntimeError as error:
         print(f"警告：讨论纪要生成失败，已继续生成主报告：{error}", flush=True)
-        discussion_markdown = "## 讨论纪要\n\n讨论纪要暂不可用。"
+        discussion_markdown = "## 纪要\n\n纪要暂不可用。"
     featured_quotes = analyze_featured_quotes(
         transcript,
         quote_count=quote_count,
@@ -1525,6 +1525,7 @@ def render_html(
     .overview-facts li {{ margin: 0; padding: 8px 10px; background: #fffefd; border: 1px solid #d3e1e7; border-radius: 8px; font-size: .9rem; line-height: 1.55; }}
     .discussion-minutes {{ margin: 2.5rem 0; padding: 24px 26px; background: #fbf7ee; border: 1px solid #ead9bd; border-radius: 14px; break-inside: avoid; page-break-inside: avoid; }}
     .discussion-minutes h2 {{ margin-top: 0; }}
+    .discussion-minutes .member-name {{ padding: 0 3px; border-radius: 4px; }}
     .discussion-chart {{ min-height: 280px; margin: 1rem 0; }}
     .discussion-topic {{ margin: 1.4rem 0 0; padding: 17px 18px; background: #fffefd; border-left: 3px solid #c17b3f; border-radius: 0 10px 10px 0; break-inside: avoid; page-break-inside: avoid; }}
     .discussion-topic h3 {{ margin-top: 0; }}
@@ -1618,61 +1619,22 @@ def render_html(
       }}
       window.__qqstalkerDiscussionChartState = "not-needed";
       const discussionHeading = Array.from(analysis.children).find(
-        (element) => element.tagName === "H2" && element.textContent.trim() === "讨论纪要",
+        (element) => element.tagName === "H2" && element.textContent.trim() === "纪要",
       );
       if (discussionHeading) {{
         const discussion = document.createElement("section");
         discussion.className = "discussion-minutes";
         analysis.insertBefore(discussion, discussionHeading);
+        const chart = document.createElement("div");
+        chart.className = "discussion-chart";
+        discussion.appendChild(chart);
         let element = discussionHeading;
         while (element && element.tagName !== "HR") {{
           const next = element.nextElementSibling;
           discussion.appendChild(element);
           element = next;
         }}
-        const heatHeading = Array.from(discussion.children).find(
-          (item) => item.tagName === "H3" && item.textContent.trim() === "讨论热度",
-        );
-        if (heatHeading) {{
-          const chart = document.createElement("div");
-          chart.className = "discussion-chart";
-          heatHeading.before(chart);
-          const fallback = document.createElement("div");
-          fallback.className = "discussion-fallback";
-          heatHeading.before(fallback);
-          fallback.appendChild(heatHeading);
-          if (heatHeading.nextElementSibling?.tagName === "TABLE") {{
-            fallback.appendChild(heatHeading.nextElementSibling);
-          }}
-          const chartData = {chart_payload};
-          if (!chartData || !window.echarts) {{
-            window.__qqstalkerDiscussionChartState = "failed";
-          }} else {{
-            try {{
-              const instance = window.echarts.init(chart);
-              instance.setOption({{
-                animation: false,
-                tooltip: {{ trigger: "axis" }},
-                legend: {{ top: 0 }},
-                grid: {{ left: 42, right: 20, top: 40, bottom: 48 }},
-                xAxis: {{ type: "category", boundaryGap: false, data: chartData.labels }},
-                yAxis: {{ type: "value", minInterval: 1, name: "讨论热度" }},
-                series: chartData.series.map((item) => ({{
-                  name: item.name, type: "line", stack: "heat", smooth: true,
-                  showSymbol: false, data: item.data, lineStyle: {{ color: item.color }},
-                  itemStyle: {{ color: item.color }}, areaStyle: {{ opacity: .55 }},
-                }})),
-              }});
-              fallback.hidden = true;
-              window.__qqstalkerDiscussionChartState = "ready";
-            }} catch (_) {{
-              window.__qqstalkerDiscussionChartState = "failed";
-            }}
-          }}
-        }}
-        Array.from(discussion.children).filter((item) =>
-          item.tagName === "H3" && item.textContent.trim() !== "讨论热度",
-        ).forEach((heading) => {{
+        Array.from(discussion.children).filter((item) => item.tagName === "H3").forEach((heading) => {{
           const topic = document.createElement("section");
           topic.className = "discussion-topic";
           heading.before(topic);
@@ -1684,6 +1646,41 @@ def render_html(
             item = next;
           }}
         }});
+        const chartData = {chart_payload};
+        const memberStyles = (chartData && chartData.member_styles) || {{}};
+        Array.from(discussion.querySelectorAll("strong")).forEach((strong) => {{
+          const style = memberStyles[strong.textContent.trim()];
+          if (style) {{
+            strong.classList.add("member-name");
+            strong.style.color = style.color;
+            strong.style.backgroundColor = style.background;
+          }}
+        }});
+        if (!chartData || !window.echarts) {{
+          chart.hidden = true;
+          window.__qqstalkerDiscussionChartState = "failed";
+        }} else {{
+          try {{
+            const instance = window.echarts.init(chart);
+            instance.setOption({{
+              animation: false,
+              tooltip: {{ trigger: "axis" }},
+              legend: {{ top: 0 }},
+              grid: {{ left: 42, right: 20, top: 40, bottom: 48 }},
+              xAxis: {{ type: "category", boundaryGap: false, data: chartData.labels }},
+              yAxis: {{ type: "value", minInterval: 1, name: "讨论热度" }},
+              series: chartData.series.map((item) => ({{
+                name: item.name, type: "line", stack: "heat", smooth: true,
+                showSymbol: false, data: item.data, lineStyle: {{ color: item.color }},
+                itemStyle: {{ color: item.color }}, areaStyle: {{ opacity: .55 }},
+              }})),
+            }});
+            window.__qqstalkerDiscussionChartState = "ready";
+          }} catch (_) {{
+            chart.hidden = true;
+            window.__qqstalkerDiscussionChartState = "failed";
+          }}
+        }}
       }}
       const quotesHeading = Array.from(analysis.children).find(
         (element) => element.tagName === "H2" && element.textContent.trim() === "语录精选",

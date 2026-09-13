@@ -167,6 +167,33 @@ class ResourceWaitTests(unittest.TestCase):
         self.assertEqual(page.wait_calls[0][1], 10_000)
         self.assertIn("__qqstalkerDiscussionChartState", page.wait_calls[0][0])
 
+    def test_cdn_timeout_hides_chart_and_marks_failure(self) -> None:
+        """A chart that never becomes ready is hidden instead of leaving a blank box."""
+
+        class Page:
+            def __init__(self) -> None:
+                self.evaluate_calls: list[str] = []
+                self.wait_calls: list[tuple[str, int]] = []
+
+            def evaluate(self, script: str) -> None:
+                self.evaluate_calls.append(script)
+
+            def wait_for_function(self, script: str, *, timeout: int) -> None:
+                self.wait_calls.append((script, timeout))
+                raise render_html_png.PlaywrightError("chart cdn unavailable")
+
+        page = Page()
+        render_html_png.wait_for_document_resources(page)  # type: ignore[arg-type]
+
+        self.assertEqual(page.wait_calls[0][1], 10_000)
+        self.assertIn("__qqstalkerDiscussionChartState", page.wait_calls[0][0])
+        self.assertTrue(
+            any(
+                "'failed'" in call and "chart.hidden = true" in call
+                for call in page.evaluate_calls
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

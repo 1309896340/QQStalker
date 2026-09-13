@@ -211,7 +211,7 @@ def wait_for_document_resources(page: Page) -> None:
             timeout=10_000,
         )
     except PlaywrightError:
-        # Keep the Markdown table fallback visible if a CDN is unavailable.
+        # Hide the failed chart container; the minutes text remains visible.
         page.evaluate(
             """() => {
                 window.__qqstalkerDiscussionChartState = 'failed';
