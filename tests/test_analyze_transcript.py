@@ -146,6 +146,25 @@ class LlmResponseCacheTests(unittest.TestCase):
             self.assertIsNone(cache.lookup(key))
             self.assertFalse(cache._path(key).exists())
 
+    def test_discard_removes_entry_and_is_idempotent(self) -> None:
+        """Discarded entries must miss on lookup; unknown keys must not raise."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = analyze_transcript.llm_cache.LlmResponseCache(Path(tmp))
+            key = analyze_transcript.llm_cache.cache_key(
+                stage_label="测试",
+                base_url="https://example.test",
+                model="test-model",
+                max_tokens=10,
+                prompt="提示",
+            )
+
+            cache.store(key, "响应文本", "stop")
+            cache.discard(key)
+            self.assertIsNone(cache.lookup(key))
+            cache.discard(key)
+            self.assertFalse(cache._path(key).exists())
+
     def test_cache_key_covers_model_stage_and_params(self) -> None:
         base = {
             "stage_label": "测试",
@@ -212,6 +231,162 @@ class LlmResponseCacheTests(unittest.TestCase):
                         timeout_seconds=1,
                         max_retries=0,
                     )
+
+
+class DiscussionCacheEvictionTests(unittest.TestCase):
+    """Rejected JSON responses must be evicted from the response cache."""
+
+    def tearDown(self) -> None:
+        analyze_transcript.llm_cache.uninstall()
+
+    @staticmethod
+    def _transcript() -> str:
+        blocks = []
+        for index, member in enumerate(("甲", "乙")):
+            blocks.append(
+                f"## 2026-09-11 09:0{index}:00 · 测试群\n\n"
+                f"> **{member}**\n>\n> 消息{index}包含较长的讨论内容便于触发分块"
+            )
+        return "\n\n".join(blocks)
+
+    def test_rejected_segment_response_is_evicted_from_cache(self) -> None:
+        """The poisoned entry must miss on rerun while the valid retry hits."""
+
+        invalid_response = "抱歉，我无法按要求数据格式回答。"
+        valid_segment_response = json.dumps(
+            {
+                "topics": [
+                    {
+                        "id": "t1",
+                        "title": "话题甲",
+                        "summary": "摘要",
+                        "substantive": True,
+                        "start_line": 1,
+                        "end_line": 2,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        segment_prompts: list[str] = []
+        valid_segment_network_responses = 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            analyze_transcript.llm_cache.install(
+                analyze_transcript.llm_cache.LlmResponseCache(Path(tmp))
+            )
+
+            def fake_post(
+                _endpoint: str, headers: object = None, json: dict[str, object] | None = None
+            ) -> MagicMock:
+                assert isinstance(json, dict)
+                messages = json.get("messages")
+                assert isinstance(messages, list)
+                first_message = messages[0]
+                assert isinstance(first_message, dict)
+                prompt = str(first_message["content"])
+                response = MagicMock()
+                response.raise_for_status.return_value = None
+
+                if "（本批次" in prompt:
+                    response.json.return_value = {
+                        "choices": [
+                            {"message": {"content": "### 甲\n- **角色定位**：测试标签"}, "finish_reason": "stop"}
+                        ]
+                    }
+                    return response
+                if "群像速览" in prompt:
+                    response.json.return_value = {
+                        "choices": [
+                            {"message": {"content": "- **整体画像**：测试概括。"}, "finish_reason": "stop"}
+                        ]
+                    }
+                    return response
+                if "start_line" in prompt:
+                    nonlocal valid_segment_network_responses
+                    first_segment_call = not segment_prompts or all(
+                        "重新完整输出" in item for item in segment_prompts
+                    )
+                    segment_prompts.append(prompt)
+                    if first_segment_call:
+                        content = invalid_response
+                    else:
+                        content = valid_segment_response
+                        valid_segment_network_responses += 1
+                    response.json.return_value = {
+                        "choices": [{"message": {"content": content}, "finish_reason": "stop"}]
+                    }
+                    return response
+                if "自然段" in prompt:
+                    response.json.return_value = {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "甲提出观点并作出总结。乙补充事实并反思讨论结果。"
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                    return response
+                response.json.return_value = {
+                    "choices": [{"message": {"content": "暂无。"}, "finish_reason": "stop"}]
+                }
+                return response
+
+            def run_flow() -> None:
+                with (
+                    patch.object(analyze_transcript.httpx, "Client") as client_class,
+                    patch.dict(os.environ, {"LLM_STREAM": "0"}),
+                ):
+                    client = client_class.return_value.__enter__.return_value
+                    client.post.side_effect = fake_post
+                    output = StringIO()
+                    with redirect_stdout(output):
+                        analyze_transcript.analyze_all_members(
+                            self._transcript(),
+                            base_url="https://example.test",
+                            model="test-model",
+                            api_key="test-key",
+                            max_tokens=100,
+                            timeout_seconds=1,
+                            members_per_request=1,
+                            max_input_characters=1_000,
+                            top_members=None,
+                            min_message_count=0,
+                        )
+
+            run_flow()
+
+            self.assertEqual(len(segment_prompts), 2)
+            plain_prompt = segment_prompts[0]
+            feedback_prompt = segment_prompts[1]
+            self.assertTrue(feedback_prompt.startswith(plain_prompt))
+            self.assertIn("重新完整输出", feedback_prompt)
+
+            plain_key = analyze_transcript.llm_cache.cache_key(
+                stage_label="讨论纪要（第 1 次请求）",
+                base_url="https://example.test",
+                model="test-model",
+                max_tokens=100,
+                prompt=plain_prompt,
+            )
+            cache = analyze_transcript.llm_cache.active()
+            assert cache is not None
+            self.assertIsNone(cache.lookup(plain_key))
+
+            stored_responses = [
+                json.loads(path.read_text(encoding="utf-8"))["response"]
+                for path in cache.directory.glob("*.json")
+            ]
+            self.assertNotIn(invalid_response, stored_responses)
+            self.assertIn(valid_segment_response, stored_responses)
+
+            segment_prompts.clear()
+            run_flow()
+
+            self.assertEqual(segment_prompts, [plain_prompt])
+            self.assertEqual(valid_segment_network_responses, 1)
 
 
 class FeaturedQuotesNormalizationTests(unittest.TestCase):
@@ -578,7 +753,7 @@ class ProgressReportingTests(unittest.TestCase):
                 ("- **群体氛围**：讨论直接。", None),
                 (
                     '{"topics":[{"id":"t1","title":"测试议题",'
-                    '"summary":"摘要","start_line":1,"end_line":2}]}',
+                    '"summary":"摘要","substantive":true,"start_line":1,"end_line":2}]}',
                     None,
                 ),
                 ("甲表达了一个观点并作出总结。乙补充了不同信息并支持继续讨论。", None),
@@ -1159,7 +1334,7 @@ class MemberBatchRecoveryTests(unittest.TestCase):
                 ("- **群体氛围**：讨论直接。", None),
                 (
                     '{"topics":[{"id":"t1","title":"测试议题",'
-                    '"summary":"摘要","start_line":1,"end_line":2}]}',
+                    '"summary":"摘要","substantive":true,"start_line":1,"end_line":2}]}',
                     None,
                 ),
                 ("甲表达了一个观点并作出总结。乙补充了不同信息并支持继续讨论。", None),

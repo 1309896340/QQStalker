@@ -1229,6 +1229,55 @@ def request_portraits(
     return content, finish_reason
 
 
+class DiscussionResponseCacheGuard:
+    """Remembers cached discussion responses so rejected ones can be evicted.
+
+    响应在返回给下游 JSON 校验之前就已写入缓存；校验失败的响应必须从
+    缓存中清除，否则后续运行会反复命中同一条投毒条目。缓存键包含阶段
+    标签（含请求序号），因此由请求方在响应返回时注册完整键信息。
+    """
+
+    def __init__(self) -> None:
+        self._handlers: dict[tuple[str, str], Callable[[], None]] = {}
+        self._lock = threading.Lock()
+
+    def register(
+        self,
+        prompt: str,
+        response: str,
+        *,
+        stage_label: str,
+        base_url: str,
+        model: str,
+        max_tokens: int | None,
+    ) -> None:
+        """Track one cached response; a no-op when the cache is not installed."""
+
+        cache = llm_cache.active()
+        if cache is None or not response:
+            return
+        key = llm_cache.cache_key(
+            stage_label=stage_label,
+            base_url=base_url,
+            model=model,
+            max_tokens=max_tokens,
+            prompt=prompt,
+        )
+        with self._lock:
+            self._handlers[(prompt, response)] = lambda: cache.discard(key)
+
+    def rejection_listener(self) -> discussion_analysis.RejectionListener:
+        """Build the callback that evicts entries for rejected responses."""
+
+        def on_rejected(prompt: str, response: str) -> None:
+            with self._lock:
+                handler = self._handlers.pop((prompt, response), None)
+            if handler is not None:
+                handler()
+
+        return on_rejected
+
+
 def analyze_member_batch(
     member_batch: tuple[tuple[str, list[str]], ...],
     *,
@@ -1583,6 +1632,7 @@ def analyze_all_members(
         try:
             discussion_request_count = 0
             discussion_request_lock = threading.Lock()
+            response_guard = DiscussionResponseCacheGuard()
 
             def checked_discussion_response(
                 result: tuple[str, str | None],
@@ -1607,18 +1657,44 @@ def analyze_all_members(
                     discussion_request_count += 1
                     stage_label = f"讨论纪要（第 {discussion_request_count} 次请求）"
 
-                def primary_request(uncapped: bool) -> tuple[str, str | None]:
-                    return request_portraits(
+                def request_and_register(
+                    *,
+                    base_url: str,
+                    model: str,
+                    api_key: str,
+                    uncapped: bool,
+                    label: str,
+                ) -> tuple[str, str | None]:
+                    request_max_tokens = None if uncapped else max_tokens
+                    result = request_portraits(
                         prompt,
                         base_url=base_url,
                         model=model,
                         api_key=api_key,
-                        max_tokens=None if uncapped else max_tokens,
+                        max_tokens=request_max_tokens,
                         timeout_seconds=timeout_seconds,
                         max_retries=max_retries,
                         retry_delay_seconds=retry_delay_seconds,
-                        stage_label=stage_label,
+                        stage_label=label,
                         reporter=reporter,
+                    )
+                    response_guard.register(
+                        prompt,
+                        result[0],
+                        stage_label=label,
+                        base_url=base_url,
+                        model=model,
+                        max_tokens=request_max_tokens,
+                    )
+                    return result
+
+                def primary_request(uncapped: bool) -> tuple[str, str | None]:
+                    return request_and_register(
+                        base_url=base_url,
+                        model=model,
+                        api_key=api_key,
+                        uncapped=uncapped,
+                        label=stage_label,
                     )
 
                 try:
@@ -1637,17 +1713,12 @@ def analyze_all_members(
                     )
 
                     def fallback_request(uncapped: bool) -> tuple[str, str | None]:
-                        return request_portraits(
-                            prompt,
+                        return request_and_register(
                             base_url=fallback_base_url,
                             model=fallback_model,
                             api_key=fallback_api_key,
-                            max_tokens=None if uncapped else max_tokens,
-                            timeout_seconds=timeout_seconds,
-                            max_retries=max_retries,
-                            retry_delay_seconds=retry_delay_seconds,
-                            stage_label=f"{stage_label}·备用模型",
-                            reporter=reporter,
+                            uncapped=uncapped,
+                            label=f"{stage_label}·备用模型",
                         )
 
                     return checked_discussion_response(
@@ -1662,6 +1733,7 @@ def analyze_all_members(
                 maximum_input_characters=max_input_characters,
                 request_text=request_discussion,
                 maximum_workers=discussion_concurrency,
+                on_rejected=response_guard.rejection_listener(),
             )
             discussion_markdown = discussion.to_markdown()
         except RuntimeError as error:

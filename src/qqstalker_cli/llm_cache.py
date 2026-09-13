@@ -71,6 +71,11 @@ class LlmResponseCache:
         except OSError:
             return
 
+    def discard(self, key: str) -> None:
+        """Drop one cached entry; missing keys are silently ignored."""
+
+        self._discard(self._path(key))
+
     def store(self, key: str, response: str, finish_reason: str | None) -> None:
         """Persist one response pair atomically; failures are silently skipped."""
 
