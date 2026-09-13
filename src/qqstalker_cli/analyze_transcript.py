@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -241,6 +242,27 @@ def thinking_control_setting() -> dict[str, str] | None:
     if normalized in {"enabled", "disabled"}:
         return {"type": normalized}
     raise RuntimeError("LLM_THINKING 必须是 enabled 或 disabled")
+
+
+def fallback_llm_setting() -> tuple[str, str, str] | None:
+    """Read the optional content-filter fallback model; all values are required."""
+
+    values = [
+        (os.getenv(name) or "").strip()
+        for name in ("LLM_FALLBACK_BASE_URL", "LLM_FALLBACK_MODEL", "LLM_FALLBACK_API_KEY")
+    ]
+    if not any(values):
+        return None
+    if not all(values):
+        raise RuntimeError(
+            "备用模型配置不完整：LLM_FALLBACK_BASE_URL、LLM_FALLBACK_MODEL、"
+            "LLM_FALLBACK_API_KEY 必须同时设置才会启用降级重试"
+        )
+    return values[0], values[1], values[2]
+
+
+class ContentFilterError(RuntimeError):
+    """A model response rejected by the provider's server-side content moderation."""
 
 
 def positive_integer(value: str) -> int:
@@ -856,7 +878,7 @@ def request_portraits(
     base_url: str,
     model: str,
     api_key: str,
-    max_tokens: int,
+    max_tokens: int | None,
     timeout_seconds: float,
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
@@ -890,8 +912,9 @@ def request_portraits(
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "max_tokens": max_tokens,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     thinking = thinking_control_setting()
     if thinking is not None:
         payload["thinking"] = thinking
@@ -1122,6 +1145,42 @@ def analyze_member_batch(
     return "\n\n".join((analysis, *recovered_profiles))
 
 
+_TRUNCATION_PROMPT_LOCK = threading.Lock()
+
+
+def _resolve_truncated_output(
+    stage_label: str,
+    response: str,
+    max_tokens: int | None,
+    request: Callable[[bool], tuple[str, str | None]],
+) -> str:
+    """Handle an output-truncated response by asking the user how to proceed.
+
+    ``request`` receives one flag: true re-sends the same request without the
+    max_tokens cap. Non-interactive runs keep the previous behavior and raise.
+    """
+
+    while True:
+        message = (
+            f"{stage_label}输出被截断（当前已输出 {len(response)} 字，"
+            f"LLM_MAX_TOKENS={max_tokens}）；请提高 LLM_MAX_TOKENS 后重试"
+        )
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise RuntimeError(message)
+        with _TRUNCATION_PROMPT_LOCK:
+            print(f"警告：{message}", flush=True)
+            choice = input("回车＝无视 token 限制重试；输入 q＝结束程序：").strip().lower()
+        if choice in {"q", "quit", "exit", "结束", "退出"}:
+            raise SystemExit(f"已按用户选择结束程序：{stage_label}输出被截断")
+        response, finish_reason = request(True)
+        if finish_reason == "content_filter":
+            raise ContentFilterError(
+                "响应被服务端内容审查拦截（finish_reason=content_filter）"
+            )
+        if finish_reason != "length":
+            return response
+
+
 def analyze_featured_quotes(
     transcript: str,
     *,
@@ -1137,21 +1196,26 @@ def analyze_featured_quotes(
 ) -> str:
     """Select the strongest humorous or provocative quotes from the full transcript."""
 
-    quotes, finish_reason = request_portraits(
-        build_featured_quotes_prompt(transcript, quote_count=quote_count),
-        base_url=base_url,
-        model=model,
-        api_key=api_key,
-        max_tokens=max_tokens,
-        timeout_seconds=timeout_seconds,
-        max_retries=max_retries,
-        retry_delay_seconds=retry_delay_seconds,
-        stage_label="语录精选",
-        reporter=reporter,
-    )
+    def request(uncapped: bool) -> tuple[str, str | None]:
+        return request_portraits(
+            build_featured_quotes_prompt(transcript, quote_count=quote_count),
+            base_url=base_url,
+            model=model,
+            api_key=api_key,
+            max_tokens=None if uncapped else max_tokens,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            retry_delay_seconds=retry_delay_seconds,
+            stage_label="语录精选",
+            reporter=reporter,
+        )
+
+    response, finish_reason = request(False)
     if finish_reason == "length":
-        raise RuntimeError("精选语录输出被截断；请提高 LLM_MAX_TOKENS 后重试")
-    return quotes.strip() or "暂无符合筛选标准的语录。"
+        response = _resolve_truncated_output(
+            "语录精选", response, max_tokens, request
+        )
+    return response.strip() or "暂无符合筛选标准的语录。"
 
 
 def analyze_group_overview(
@@ -1168,21 +1232,26 @@ def analyze_group_overview(
 ) -> str:
     """Generate the interpretive portion of the report overview."""
 
-    overview, finish_reason = request_portraits(
-        build_group_overview_prompt(portraits),
-        base_url=base_url,
-        model=model,
-        api_key=api_key,
-        max_tokens=max_tokens,
-        timeout_seconds=timeout_seconds,
-        max_retries=max_retries,
-        retry_delay_seconds=retry_delay_seconds,
-        stage_label="群像速览",
-        reporter=reporter,
-    )
+    def request(uncapped: bool) -> tuple[str, str | None]:
+        return request_portraits(
+            build_group_overview_prompt(portraits),
+            base_url=base_url,
+            model=model,
+            api_key=api_key,
+            max_tokens=None if uncapped else max_tokens,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            retry_delay_seconds=retry_delay_seconds,
+            stage_label="群像速览",
+            reporter=reporter,
+        )
+
+    response, finish_reason = request(False)
     if finish_reason == "length":
-        raise RuntimeError("群像速览输出被截断；请提高 LLM_MAX_TOKENS 后重试")
-    return overview.strip() or "- **整体画像**：证据不足，暂不作概括。"
+        response = _resolve_truncated_output(
+            "群像速览", response, max_tokens, request
+        )
+    return response.strip() or "- **整体画像**：证据不足，暂不作概括。"
 
 
 def analyze_all_members(
@@ -1207,6 +1276,7 @@ def analyze_all_members(
     portrait_concurrency: int = 1,
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_delay_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
+    fallback_llm: tuple[str, str, str] | None = None,
 ) -> AnalysisReport:
     """Produce a complete portrait section for every member in the transcript."""
 
@@ -1330,30 +1400,77 @@ def analyze_all_members(
             discussion_request_count = 0
             discussion_request_lock = threading.Lock()
 
+            def checked_discussion_response(
+                result: tuple[str, str | None],
+                *,
+                request: Callable[[bool], tuple[str, str | None]],
+                stage_label: str,
+            ) -> str:
+                response, finish_reason = result
+                if finish_reason == "content_filter":
+                    raise ContentFilterError(
+                        "响应被服务端内容审查拦截（finish_reason=content_filter）"
+                    )
+                if finish_reason == "length":
+                    return _resolve_truncated_output(
+                        stage_label, response, max_tokens, request
+                    )
+                return response
+
             def request_discussion(prompt: str) -> str:
                 nonlocal discussion_request_count
                 with discussion_request_lock:
                     discussion_request_count += 1
                     stage_label = f"讨论纪要（第 {discussion_request_count} 次请求）"
-                response, finish_reason = request_portraits(
-                    prompt,
-                    base_url=base_url,
-                    model=model,
-                    api_key=api_key,
-                    max_tokens=max_tokens,
-                    timeout_seconds=timeout_seconds,
-                    max_retries=max_retries,
-                    retry_delay_seconds=retry_delay_seconds,
-                    stage_label=stage_label,
-                    reporter=reporter,
-                )
-                if finish_reason == "length":
-                    raise RuntimeError("讨论纪要输出被截断；请提高 LLM_MAX_TOKENS 后重试")
-                if finish_reason == "content_filter":
-                    raise RuntimeError(
-                        "响应被服务端内容审查拦截（finish_reason=content_filter）"
+
+                def primary_request(uncapped: bool) -> tuple[str, str | None]:
+                    return request_portraits(
+                        prompt,
+                        base_url=base_url,
+                        model=model,
+                        api_key=api_key,
+                        max_tokens=None if uncapped else max_tokens,
+                        timeout_seconds=timeout_seconds,
+                        max_retries=max_retries,
+                        retry_delay_seconds=retry_delay_seconds,
+                        stage_label=stage_label,
+                        reporter=reporter,
                     )
-                return response
+
+                try:
+                    return checked_discussion_response(
+                        primary_request(False),
+                        request=primary_request,
+                        stage_label=stage_label,
+                    )
+                except ContentFilterError:
+                    if fallback_llm is None:
+                        raise
+                    fallback_base_url, fallback_model, fallback_api_key = fallback_llm
+                    reporter.print(
+                        f"{stage_label}：响应被服务端内容审查拦截，"
+                        f"降级到备用模型 {fallback_model} 重试"
+                    )
+
+                    def fallback_request(uncapped: bool) -> tuple[str, str | None]:
+                        return request_portraits(
+                            prompt,
+                            base_url=fallback_base_url,
+                            model=fallback_model,
+                            api_key=fallback_api_key,
+                            max_tokens=None if uncapped else max_tokens,
+                            timeout_seconds=timeout_seconds,
+                            max_retries=max_retries,
+                            retry_delay_seconds=retry_delay_seconds,
+                            stage_label=f"{stage_label}·备用模型",
+                            reporter=reporter,
+                        )
+
+                    return checked_discussion_response(
+                        fallback_request(False),
+                        request=fallback_request,
+                        stage_label=f"{stage_label}·备用模型",
+                    )
 
             discussion = discussion_analysis.analyze_discussion_minutes(
                 chronological_messages,
@@ -1851,6 +1968,7 @@ def main() -> None:
         portrait_concurrency = positive_integer_setting(
             "LLM_PORTRAIT_CONCURRENCY", DEFAULT_PORTRAIT_CONCURRENCY
         )
+        fallback_llm = fallback_llm_setting()
         if not args.input_markdown.is_file():
             raise FileNotFoundError(f"消息记录文件不存在：{args.input_markdown}")
         model = required_setting("LLM_MODEL")
@@ -1900,6 +2018,7 @@ def main() -> None:
             max_discussion_topics=max_discussion_topics,
             discussion_concurrency=discussion_concurrency,
             portrait_concurrency=portrait_concurrency,
+            fallback_llm=fallback_llm,
         )
         analysis_markdown, discussion = unpack_analysis_report(analysis)
         output_path.parent.mkdir(parents=True, exist_ok=True)

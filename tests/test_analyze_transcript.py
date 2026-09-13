@@ -1141,6 +1141,101 @@ class ConcurrentProgressIntegrationTests(unittest.TestCase):
         self.assertTrue(all(event[2] is True for event in finishes))
 
 
+class FakeTtyStream:
+    """Minimal tty-like stream so truncation prompts enter interactive mode."""
+
+    def __init__(self) -> None:
+        self.written: list[str] = []
+
+    def isatty(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        self.written.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+
+class TruncationChoiceTests(unittest.TestCase):
+    """Output truncation must ask the user instead of aborting outright."""
+
+    def test_truncated_output_retries_without_token_cap_when_user_confirms(
+        self,
+    ) -> None:
+        """Confirming the prompt re-sends the request without the max_tokens cap."""
+
+        captured_limits: list[int | None] = []
+
+        def fake_request(prompt: str, **kwargs: object) -> tuple[str, str | None]:
+            captured_limits.append(kwargs.get("max_tokens"))  # type: ignore[arg-type]
+            if len(captured_limits) == 1:
+                return "部分语录", "length"
+            return "完整语录内容", None
+
+        with patch.object(
+            analyze_transcript, "request_portraits", side_effect=fake_request
+        ), patch("sys.stdin", FakeTtyStream()), patch(
+            "sys.stdout", FakeTtyStream()
+        ), patch("builtins.input", return_value=""):
+            quotes = analyze_transcript.analyze_featured_quotes(
+                "> **甲**\n>\n> 消息",
+                quote_count=5,
+                base_url="https://example.test",
+                model="test-model",
+                api_key="test-key",
+                max_tokens=100,
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(quotes, "完整语录内容")
+        self.assertEqual(captured_limits, [100, None])
+
+    def test_truncated_output_ends_program_when_user_quits(self) -> None:
+        """Choosing q must end the program with a clear message."""
+
+        def fake_request(_prompt: str, **_kwargs: object) -> tuple[str, str | None]:
+            return "部分语录", "length"
+
+        with patch.object(
+            analyze_transcript, "request_portraits", side_effect=fake_request
+        ), patch("sys.stdin", FakeTtyStream()), patch(
+            "sys.stdout", FakeTtyStream()
+        ), patch("builtins.input", return_value="q"), self.assertRaisesRegex(
+            SystemExit, "已按用户选择结束程序：语录精选输出被截断"
+        ):
+            analyze_transcript.analyze_featured_quotes(
+                "> **甲**\n>\n> 消息",
+                quote_count=5,
+                base_url="https://example.test",
+                model="test-model",
+                api_key="test-key",
+                max_tokens=100,
+                timeout_seconds=1,
+            )
+
+    def test_truncated_output_raises_when_non_interactive(self) -> None:
+        """Piped runs keep raising so automation does not silently hang."""
+
+        def fake_request(_prompt: str, **_kwargs: object) -> tuple[str, str | None]:
+            return "部分语录", "length"
+
+        with patch.object(
+            analyze_transcript, "request_portraits", side_effect=fake_request
+        ), patch("sys.stdin", StringIO()), redirect_stdout(StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "当前已输出 4 字"):
+                analyze_transcript.analyze_featured_quotes(
+                    "> **甲**\n>\n> 消息",
+                    quote_count=5,
+                    base_url="https://example.test",
+                    model="test-model",
+                    api_key="test-key",
+                    max_tokens=100,
+                    timeout_seconds=1,
+                )
+
+
 class DiscussionMinutesTests(unittest.TestCase):
     def test_discussion_topic_limit_defaults_and_rejects_invalid_values(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -1761,6 +1856,178 @@ class DiscussionMinutesTests(unittest.TestCase):
         self.assertEqual(
             report.topics[0].minutes, "该议题的纪要生成失败，未能概括讨论内容。"
         )
+
+    def test_fallback_llm_setting_requires_complete_configuration(self) -> None:
+        """The fallback model is either fully configured or disabled entirely."""
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(analyze_transcript.fallback_llm_setting())
+        with patch.dict(
+            os.environ,
+            {
+                "LLM_FALLBACK_BASE_URL": "https://fallback.test/v1",
+                "LLM_FALLBACK_MODEL": "fallback-model",
+                "LLM_FALLBACK_API_KEY": "fallback-key",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                analyze_transcript.fallback_llm_setting(),
+                ("https://fallback.test/v1", "fallback-model", "fallback-key"),
+            )
+        for partial in (
+            {"LLM_FALLBACK_BASE_URL": "https://fallback.test/v1"},
+            {
+                "LLM_FALLBACK_BASE_URL": "https://fallback.test/v1",
+                "LLM_FALLBACK_MODEL": "fallback-model",
+            },
+        ):
+            with patch.dict(os.environ, partial, clear=True), self.assertRaisesRegex(
+                RuntimeError, "备用模型配置不完整"
+            ):
+                analyze_transcript.fallback_llm_setting()
+
+    @staticmethod
+    def _discussion_transcript() -> str:
+        blocks = []
+        for offset in range(2):
+            blocks.append(
+                f"## 2026-09-11 19:00:{offset:02d} · 测试群\n\n"
+                f"> **甲**\n>\n> 讨论消息{offset}"
+            )
+        return "\n\n".join(blocks)
+
+    def test_discussion_content_filter_falls_back_to_backup_model(self) -> None:
+        """A moderation-refused discussion request is retried on the fallback model."""
+
+        models_used: list[str | None] = []
+
+        def fake_request(prompt: str, **kwargs: object) -> tuple[str, str | None]:
+            model = kwargs.get("model")
+            models_used.append(model if isinstance(model, str) else None)
+            if "start_line" in prompt:
+                if model == "test-model":
+                    return "", "content_filter"
+                positions = [
+                    int(value) for value in re.findall(r"(?m)^\[(\d+) \|", prompt)
+                ]
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "id": "t1",
+                                "title": "统一议题",
+                                "summary": "摘要",
+                                "substantive": True,
+                                "start_line": positions[0],
+                                "end_line": positions[-1],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ), None
+            if "讨论纪要" in prompt:
+                return "甲提出核心观点并总结方向。乙补充事实并反思结论。", None
+            if "群像速览" in prompt:
+                return "- **整体画像**：测试概括。", None
+            member = re.search(r"(?m)^- (\S+)（本批次", prompt)
+            if member:
+                return f"### {member.group(1)}\n- **角色定位**：测试标签", None
+            return "", None
+
+        with patch.object(
+            analyze_transcript, "request_portraits", side_effect=fake_request
+        ), patch.object(
+            analyze_transcript, "analyze_featured_quotes", return_value="暂无。"
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                analysis = analyze_transcript.analyze_all_members(
+                    self._discussion_transcript(),
+                    base_url="https://example.test",
+                    model="test-model",
+                    api_key="test-key",
+                    max_tokens=100,
+                    timeout_seconds=1,
+                    members_per_request=2,
+                    max_input_characters=1_000,
+                    top_members=None,
+                    min_message_count=0,
+                    fallback_llm=(
+                        "https://fallback.test/v1",
+                        "fallback-model",
+                        "fallback-key",
+                    ),
+                )
+
+        self.assertIn("test-model", models_used)
+        self.assertIn("fallback-model", models_used)
+        self.assertIn("降级到备用模型 fallback-model", output.getvalue())
+        self.assertIn("统一议题", analysis.markdown)
+        self.assertIn("提出核心观点并总结方向", analysis.markdown)
+
+    def test_discussion_content_filter_without_fallback_degrades_to_unavailable(
+        self,
+    ) -> None:
+        """Without a fallback model, a refused merge still degrades the whole minutes."""
+
+        def fake_request(prompt: str, **_kwargs: object) -> tuple[str, str | None]:
+            if "start_line" in prompt:
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "id": "t1",
+                                "title": "话题甲",
+                                "summary": "摘要",
+                                "substantive": True,
+                                "start_line": 1,
+                                "end_line": 1,
+                            },
+                            {
+                                "id": "t2",
+                                "title": "话题乙",
+                                "summary": "摘要",
+                                "substantive": True,
+                                "start_line": 2,
+                                "end_line": 2,
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                ), None
+            if "候选议题如下" in prompt:
+                return "", "content_filter"
+            member = re.search(r"(?m)^- (\S+)（本批次", prompt)
+            if member:
+                return f"### {member.group(1)}\n- **角色定位**：测试标签", None
+            if "群像速览" in prompt:
+                return "- **整体画像**：测试概括。", None
+            return "", None
+
+        with patch.object(
+            analyze_transcript, "request_portraits", side_effect=fake_request
+        ), patch.object(
+            analyze_transcript, "analyze_featured_quotes", return_value="暂无。"
+        ):
+            output = StringIO()
+            with redirect_stdout(output):
+                analysis = analyze_transcript.analyze_all_members(
+                    self._discussion_transcript(),
+                    base_url="https://example.test",
+                    model="test-model",
+                    api_key="test-key",
+                    max_tokens=100,
+                    timeout_seconds=1,
+                    members_per_request=2,
+                    max_input_characters=1_000,
+                    top_members=None,
+                    min_message_count=0,
+                )
+
+        self.assertIn("讨论纪要生成失败", output.getvalue())
+        self.assertIn("纪要暂不可用", analysis.markdown)
+        self.assertNotIn("fallback-model", output.getvalue())
 
     def test_segment_window_bounds_classification_chunks(self) -> None:
         """Segment prompts stay in a window where exact id coverage stays reliable."""
