@@ -78,7 +78,8 @@
       "module": "src.qqstalker_cli.generate_portrait",
       "args": [
         "2026-09-12",
-        "电影迷交流群",
+        "DirectX&AI学习交流群",
+        // "电影迷交流群",
         // "c++中文周刊交流群",
         "${workspaceFolder}/analysis",
         // "--end-date",
