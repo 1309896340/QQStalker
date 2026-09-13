@@ -278,6 +278,22 @@ class FeaturedQuotesNormalizationTests(unittest.TestCase):
             ],
         )
 
+    def test_parses_member_name_label_variants(self) -> None:
+        """Models sometimes write 成员名称/语录名 labels; these must still parse."""
+
+        records = analyze_transcript.parse_featured_quotes(
+            "成员名称：甲\n语录：这也太逆天了\n点评：荒诞反差强烈。\n\n"
+            "成员名：乙\n语录名：第二句\n点评：点评二。"
+        )
+
+        self.assertEqual(
+            records,
+            [
+                ("甲", [("这也太逆天了", "荒诞反差强烈。")]),
+                ("乙", [("第二句", "点评二。")]),
+            ],
+        )
+
     def test_groups_flat_list_items_by_member(self) -> None:
         """Legacy flat bullet output must regroup all quotes per member."""
 
@@ -437,9 +453,10 @@ class PromptTests(unittest.TestCase):
 
         self.assertIn("幽默、讽刺或“逆天”程度", prompt)
         self.assertIn("精选 8 条", prompt)
-        self.assertIn("成员：成员名称", prompt)
-        self.assertIn("语录：语录原文", prompt)
-        self.assertIn("点评：点评内容", prompt)
+        self.assertIn("行首标签必须是「成员」「语录」「点评」", prompt)
+        self.assertIn("成员：<该成员在记录中的名称>", prompt)
+        self.assertIn("语录：<发言原文>", prompt)
+        self.assertIn("点评：<点评内容>", prompt)
         self.assertIn("不要使用任何 Markdown 标记", prompt)
         self.assertIn("QQ 表情", prompt)
         self.assertIn("从展示语录中去除", prompt)
