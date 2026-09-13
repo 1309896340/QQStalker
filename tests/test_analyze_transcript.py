@@ -877,7 +877,12 @@ class ProgressReportingTests(unittest.TestCase):
                     '"summary":"摘要","substantive":true,"start_line":1,"end_line":2}]}',
                     None,
                 ),
-                ("甲表达了一个观点并作出总结。乙补充了不同信息并支持继续讨论。", None),
+                (
+                    '{"summary":"两位成员就话题交换了意见。",'
+                    '"points":[{"member":"甲","text":"甲表达了观点并作出总结。"},'
+                    '{"member":"乙","text":"乙补充了不同信息并支持继续讨论。"}]}',
+                    None,
+                ),
                 ("", None),
             ),
         ) as request_mock:
@@ -907,6 +912,10 @@ class ProgressReportingTests(unittest.TestCase):
         self.assertEqual(stage_labels[2], "讨论纪要（第 1 次请求）")
         self.assertEqual(stage_labels[3], "讨论纪要（第 2 次请求）")
         self.assertEqual(stage_labels[4], "语录精选")
+        # 分段请求保持普通模式；最终结构化纪要与语录精选请求启用 JSON 模式
+        self.assertIs(request_mock.call_args_list[2].kwargs.get("json_output"), False)
+        self.assertIs(request_mock.call_args_list[3].kwargs.get("json_output"), True)
+        self.assertIs(request_mock.call_args_list[4].kwargs.get("json_output"), True)
 
 
 class LlmTraceTests(unittest.TestCase):
@@ -1458,7 +1467,12 @@ class MemberBatchRecoveryTests(unittest.TestCase):
                     '"summary":"摘要","substantive":true,"start_line":1,"end_line":2}]}',
                     None,
                 ),
-                ("甲表达了一个观点并作出总结。乙补充了不同信息并支持继续讨论。", None),
+                (
+                    '{"summary":"两位成员就话题交换了意见。",'
+                    '"points":[{"member":"甲","text":"甲表达了观点并作出总结。"},'
+                    '{"member":"乙","text":"乙补充了不同信息并支持继续讨论。"}]}',
+                    None,
+                ),
                 ("", None),
             ),
         ):
@@ -1477,6 +1491,234 @@ class MemberBatchRecoveryTests(unittest.TestCase):
 
         self.assertIn("**分析成员**：1 位", analysis.markdown)
         self.assertNotIn("**分析成员**：2 位", analysis.markdown)
+
+
+class StructuredMinutesContractTests(unittest.TestCase):
+    """最终结构化纪要契约：解析校验、抢救与重写请求路径。"""
+
+    ROSTER = ("减肥", "王小明")
+    VALID_RESPONSE = (
+        '{"summary":"双方就房价走势分歧明显。",'
+        '"points":[{"member":"减肥","text":"减肥认为房价会继续回落。"},'
+        '{"member":"王小明","text":"王小明坚持核心地段依旧保值。"}],'
+        '"conclusion":"双方约定半年后再看行情。"}'
+    )
+
+    def test_parse_accepts_valid_contract(self) -> None:
+        minutes = discussion_analysis._parse_structured_minutes(
+            self.VALID_RESPONSE, self.ROSTER
+        )
+        self.assertEqual(
+            minutes,
+            discussion_analysis.TopicMinutes(
+                "双方就房价走势分歧明显。",
+                (
+                    discussion_analysis.MinutePoint("减肥", "减肥认为房价会继续回落。"),
+                    discussion_analysis.MinutePoint(
+                        "王小明", "王小明坚持核心地段依旧保值。"
+                    ),
+                ),
+                "双方约定半年后再看行情。",
+                None,
+            ),
+        )
+
+    def test_parse_rejects_unknown_member_and_names_roster(self) -> None:
+        response = (
+            '{"summary":"双方就房价走势分歧明显。",'
+            '"points":[{"member":"减脂","text":"减脂认为房价会继续回落。"}]}'
+        )
+        with self.assertRaises(
+            discussion_analysis.MinutesMemberError, msg="member 必须逐字使用名单署名"
+        ) as context:
+            discussion_analysis._parse_structured_minutes(response, self.ROSTER)
+        self.assertIn("减脂", str(context.exception))
+        self.assertIn("减肥", str(context.exception))
+
+    def test_parse_rejects_missing_points_and_invalid_json(self) -> None:
+        with self.assertRaises(discussion_analysis.MinutesFormatError):
+            discussion_analysis._parse_structured_minutes(
+                '{"summary":"只有总览。"}', self.ROSTER
+            )
+        with self.assertRaises(discussion_analysis.MinutesFormatError):
+            discussion_analysis._parse_structured_minutes("不是 JSON", self.ROSTER)
+
+    def test_parse_rejects_overlength_point_and_missing_sentence_end(self) -> None:
+        overlong = (
+            '{"summary":"总览。",'
+            f'"points":[{{"member":"减肥","text":"{"字" * 101}。"}}]}}'
+        )
+        with self.assertRaisesRegex(discussion_analysis.MinutesFormatError, "100 字"):
+            discussion_analysis._parse_structured_minutes(overlong, self.ROSTER)
+        no_end = (
+            '{"summary":"总览。",'
+            '"points":[{"member":"减肥","text":"减肥认为房价会继续回落"}]}'
+        )
+        with self.assertRaisesRegex(discussion_analysis.MinutesFormatError, "句末标点"):
+            discussion_analysis._parse_structured_minutes(no_end, self.ROSTER)
+
+    def test_parse_rejects_overlength_total(self) -> None:
+        text = "观点描述" * 24 + "。"
+        payload = {
+            "summary": "总" * 60,
+            "points": [
+                {"member": "减肥", "text": text},
+                {"member": "减肥", "text": text},
+                {"member": "王小明", "text": text},
+                {"member": "王小明", "text": text},
+            ],
+        }
+        with self.assertRaises(discussion_analysis.MinutesOverlengthError):
+            discussion_analysis._parse_structured_minutes(
+                json.dumps(payload, ensure_ascii=False), self.ROSTER
+            )
+
+    def test_parse_rejects_boilerplate_opening_and_closing(self) -> None:
+        opening = (
+            '{"summary":"本次围绕房价展开讨论。",'
+            '"points":[{"member":"减肥","text":"减肥认为房价会继续回落。"}]}'
+        )
+        with self.assertRaises(discussion_analysis.MinutesBoilerplateError):
+            discussion_analysis._parse_structured_minutes(opening, self.ROSTER)
+        opening_variant = (
+            '{"summary":"本次讨论围绕房价走势。",'
+            '"points":[{"member":"减肥","text":"减肥认为房价会继续回落。"}]}'
+        )
+        with self.assertRaises(discussion_analysis.MinutesBoilerplateError):
+            discussion_analysis._parse_structured_minutes(opening_variant, self.ROSTER)
+        closing = (
+            '{"summary":"双方分歧明显。",'
+            '"points":[{"member":"减肥","text":"减肥认为房价会继续回落。"}],'
+            '"conclusion":"本次讨论未达成最终结论，各方交换了看法。"}'
+        )
+        with self.assertRaises(discussion_analysis.MinutesBoilerplateError):
+            discussion_analysis._parse_structured_minutes(closing, self.ROSTER)
+        closing_variant = (
+            '{"summary":"双方分歧明显。",'
+            '"points":[{"member":"减肥","text":"减肥认为房价会继续回落。"}],'
+            '"conclusion":"本次讨论围绕配队强度交换了多种观点。"}'
+        )
+        with self.assertRaises(discussion_analysis.MinutesBoilerplateError):
+            discussion_analysis._parse_structured_minutes(closing_variant, self.ROSTER)
+        closing_chat = (
+            '{"summary":"话题随机发散。",'
+            '"points":[{"member":"减肥","text":"减肥分享了日常见闻。"}],'
+            '"conclusion":"本次闲聊属于日常话题发散，没有形成特定结论。"}'
+        )
+        with self.assertRaises(discussion_analysis.MinutesBoilerplateError):
+            discussion_analysis._parse_structured_minutes(closing_chat, self.ROSTER)
+
+    def test_parse_rejects_missing_coverage(self) -> None:
+        response = (
+            '{"summary":"双方就房价走势分歧明显。",'
+            '"points":[{"member":"减肥","text":"减肥认为房价会继续回落。"}]}'
+        )
+        with self.assertRaises(discussion_analysis.MemberCoverageError) as context:
+            discussion_analysis._parse_structured_minutes(response, self.ROSTER)
+        self.assertEqual(context.exception.missing, ("王小明",))
+
+    def test_salvage_keeps_valid_pieces_and_drops_invalid_entries(self) -> None:
+        response = (
+            '{"summary":"双方就房价走势分歧明显。",'
+            '"points":[{"member":"减脂","text":"减脂认为房价会继续回落。"},'
+            '{"member":"王小明","text":"王小明坚持核心地段依旧保值"},'
+            '{"member":"减肥","text":"减肥认为房价会继续回落。"}],'
+            '"conclusion":"无标点的收束"}'
+        )
+        salvaged = discussion_analysis._salvage_structured_minutes(
+            response, self.ROSTER
+        )
+        assert salvaged is not None
+        self.assertEqual(
+            salvaged,
+            discussion_analysis.TopicMinutes(
+                "双方就房价走势分歧明显。",
+                (discussion_analysis.MinutePoint("减肥", "减肥认为房价会继续回落。"),),
+                None,
+                None,
+            ),
+        )
+
+    def test_salvage_returns_none_without_usable_points(self) -> None:
+        self.assertIsNone(
+            discussion_analysis._salvage_structured_minutes(
+                "抱歉，我无法回答。", self.ROSTER
+            )
+        )
+        garbage = (
+            '{"summary":"总览。",'
+            '"points":[{"member":"路人","text":"路人觉得可以接受。"}]}'
+        )
+        self.assertIsNone(
+            discussion_analysis._salvage_structured_minutes(garbage, self.ROSTER)
+        )
+
+    def test_structured_instruction_states_contract_and_roster(self) -> None:
+        instruction = discussion_analysis._structured_minutes_instruction(
+            "房价讨论", self.ROSTER, merged=True
+        )
+        self.assertIn("主要参与者名单：减肥、王小明", instruction)
+        self.assertIn('"summary"', instruction)
+        self.assertIn('"points"', instruction)
+        self.assertIn("逐字使用主要参与者名单中的完整署名", instruction)
+        self.assertIn("高度凝练", instruction)
+        self.assertIn("中立笔法", instruction)
+        self.assertIn("400 字", instruction)
+        self.assertIn("压缩归纳为一份最终结构化纪要", instruction)
+
+    def test_structured_minutes_rewrites_with_feedback_then_succeeds(self) -> None:
+        prompts: list[str] = []
+
+        def fake_request(prompt: str, *, json_output: bool = False) -> str:
+            prompts.append(prompt)
+            return ["不是 JSON", self.VALID_RESPONSE][len(prompts) - 1]
+
+        result = discussion_analysis._structured_minutes(
+            "撰写提示", request_text=fake_request, expected=self.ROSTER
+        )
+        self.assertEqual(
+            result.points[0], discussion_analysis.MinutePoint("减肥", "减肥认为房价会继续回落。")
+        )
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("未通过校验", prompts[1])
+        self.assertIn("完整重新输出", prompts[1])
+
+    def test_structured_minutes_salvages_after_exhausted_rewrites(self) -> None:
+        bad_response = (
+            '{"summary":"双方分歧明显。",'
+            '"points":[{"member":"减脂","text":"减脂认为房价会继续回落。"},'
+            '{"member":"减肥","text":"减肥认为房价会继续回落。"}]}'
+        )
+        prompts: list[str] = []
+
+        def fake_request(prompt: str, *, json_output: bool = False) -> str:
+            prompts.append(prompt)
+            return bad_response
+
+        result = discussion_analysis._structured_minutes(
+            "撰写提示", request_text=fake_request, expected=self.ROSTER
+        )
+        self.assertEqual(
+            result,
+            discussion_analysis.TopicMinutes(
+                "双方分歧明显。",
+                (discussion_analysis.MinutePoint("减肥", "减肥认为房价会继续回落。"),),
+                None,
+                None,
+            ),
+        )
+        # 三次带反馈重写 + 一次原始请求，穷尽后抢救部分有效结果
+        self.assertEqual(len(prompts), 4)
+        self.assertIn("member 必须逐字使用", prompts[1])
+
+    def test_structured_minutes_raises_when_nothing_salvages(self) -> None:
+        def fake_request(prompt: str, *, json_output: bool = False) -> str:
+            return "抱歉，我无法回答。"
+
+        with self.assertRaises(RuntimeError):
+            discussion_analysis._structured_minutes(
+                "撰写提示", request_text=fake_request, expected=self.ROSTER
+            )
 
 
 class PortraitBatchConcurrencyTests(unittest.TestCase):
@@ -1949,7 +2191,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
         self.assertTrue(all(len(chunk.prompt) <= 500 for chunk in chunks))
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             if "候选议题如下" in prompt:
                 payload = prompt.split("候选议题如下：\n", 1)[1]
                 return json.dumps(
@@ -2015,7 +2257,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
         seen_threads: set[str] = set()
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             seen_threads.add(threading.current_thread().name)
             if "候选议题如下" in prompt:
                 payload = prompt.split("候选议题如下：\n", 1)[1]
@@ -2146,7 +2388,7 @@ class DiscussionMinutesTests(unittest.TestCase):
             for index in range(4)
         )
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             if "候选议题如下" in prompt:
                 identifiers = re.findall(r'"id":"(segment-0:[^"]+)"', prompt)
                 a_id = next(item for item in identifiers if item.endswith(":a"))
@@ -2216,7 +2458,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
         calls = iter(range(1))
 
-        def scripted_request(_prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             next(calls)
             return json.dumps(
                 {
@@ -2282,8 +2524,12 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
 
         responses = [long_text, long_text, long_text, long_text]
+
+        def pop_response(prompt: str, *, json_output: bool = False) -> str:
+            return responses.pop(0)
+
         result = discussion_analysis._bounded_minutes(
-            "任意提示", request_text=lambda _prompt: responses.pop(0)
+            "任意提示", request_text=pop_response
         )
         self.assertFalse(responses)
         self.assertLessEqual(len(result), discussion_analysis.MAX_MINUTES_CHARACTERS)
@@ -2301,7 +2547,70 @@ class DiscussionMinutesTests(unittest.TestCase):
 
         no_punctuation = "甲" * 30
         self.assertEqual(
-            discussion_analysis.truncate_at_sentence(no_punctuation, 10), "甲" * 10
+            discussion_analysis.truncate_at_sentence(no_punctuation, 10),
+            "甲" * 9 + "…",
+        )
+        self.assertEqual(
+            discussion_analysis.truncate_at_sentence(
+                no_punctuation, 10, ellipsis=False
+            ),
+            "甲" * 10,
+        )
+
+    def test_truncate_at_sentence_avoids_boundaries_inside_markers(self) -> None:
+        """Sentence ends inside <<name>> markers or member names are not boundaries."""
+
+        head = "甲" * 260 + "。"
+        text = (
+            head
+            + "<<珂神神了！（不打深塔）>>认为共效需要达到两百六十共效才算合格，"
+            + "不到共效需要打回重练并且要消耗大量体力和时间成本才能完成"
+        )
+        truncated = discussion_analysis.truncate_at_sentence(
+            text, discussion_analysis.MAX_MINUTES_CHARACTERS, ("珂神神了！（不打深塔）",)
+        )
+        self.assertEqual(truncated, head)
+        self.assertNotIn("<<", truncated)
+
+    def test_truncate_at_sentence_hard_cut_backs_off_before_member_span(self) -> None:
+        """A hard cut landing inside a marker or name backs off before the span."""
+
+        text = "甲" * 295 + "<<珂神神了！（不打深塔）>>认为后续内容继续展开没有句末标点"
+        self.assertEqual(
+            discussion_analysis.truncate_at_sentence(
+                text,
+                discussion_analysis.MAX_MINUTES_CHARACTERS,
+                ("珂神神了！（不打深塔）",),
+            ),
+            "甲" * 295 + "…",
+        )
+        self.assertEqual(
+            discussion_analysis.truncate_at_sentence(
+                text,
+                discussion_analysis.MAX_MINUTES_CHARACTERS,
+                ("珂神神了！（不打深塔）",),
+                ellipsis=False,
+            ),
+            "甲" * 295,
+        )
+
+        bare = "甲" * 296 + "珂神神了！认为后续内容继续展开没有任何句末标点出现"
+        self.assertEqual(
+            discussion_analysis.truncate_at_sentence(
+                bare,
+                discussion_analysis.MAX_MINUTES_CHARACTERS,
+                ("珂神神了！（不打深塔）",),
+            ),
+            "甲" * 296 + "…",
+        )
+        self.assertEqual(
+            discussion_analysis.truncate_at_sentence(
+                bare,
+                discussion_analysis.MAX_MINUTES_CHARACTERS,
+                ("珂神神了！（不打深塔）",),
+                ellipsis=False,
+            ),
+            "甲" * 296,
         )
 
     def test_bounded_minutes_rewrites_with_compression_feedback(self) -> None:
@@ -2309,7 +2618,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         good_text = "甲提出核心观点。乙补充事实并总结结论。"
         prompts: list[str] = []
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             prompts.append(prompt)
             return [long_text, good_text][len(prompts) - 1]
 
@@ -2326,7 +2635,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         long_text = "甲提出观点并说明理由。" * 30
         prompts: list[str] = []
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             prompts.append(prompt)
             return long_text
 
@@ -2340,22 +2649,31 @@ class DiscussionMinutesTests(unittest.TestCase):
         """A long comma-only paragraph is truncated instead of dropping to excerpts."""
 
         run_on = "模型用逗号连接的漫长发言，" * 60
+        def run_on_response(prompt: str, *, json_output: bool = False) -> str:
+            return run_on
+
         result = discussion_analysis._bounded_minutes(
-            "任意提示", request_text=lambda _prompt: run_on
+            "任意提示", request_text=run_on_response
         )
         self.assertLessEqual(len(result), discussion_analysis.MAX_MINUTES_CHARACTERS)
         self.assertGreater(len(result), 0)
 
         refusal = "抱歉，我无法回答这个问题。"
+
+        def refusal_response(prompt: str, *, json_output: bool = False) -> str:
+            return refusal
         with self.assertRaisesRegex(RuntimeError, "讨论纪要必须是包含多个句子的自然段"):
             discussion_analysis._bounded_minutes(
-                "任意提示", request_text=lambda _prompt: refusal
+                "任意提示", request_text=refusal_response
             )
 
         unsafe = "<script>alert(1)</script>" + "长内容，" * 100
+
+        def unsafe_response(prompt: str, *, json_output: bool = False) -> str:
+            return unsafe
         with self.assertRaisesRegex(RuntimeError, "可执行标记"):
             discussion_analysis._bounded_minutes(
-                "任意提示", request_text=lambda _prompt: unsafe
+                "任意提示", request_text=unsafe_response
             )
 
     def test_find_uncovered_members_matches_names_aliases_and_boundaries(self) -> None:
@@ -2374,6 +2692,19 @@ class DiscussionMinutesTests(unittest.TestCase):
         self.assertEqual(conflict, ("祥子(备注)",))
 
         self.assertEqual(discussion_analysis.find_uncovered_members("任意文本。", ()), ())
+
+    def test_find_uncovered_members_requires_markers_for_degenerate_names(self) -> None:
+        """Punctuation-only and single-digit names are covered only via markers."""
+
+        expected = ("。", "2", "简")
+        self.assertEqual(
+            discussion_analysis.find_uncovered_members("看法。共2条。简说了。", expected),
+            ("。", "2"),
+        )
+        self.assertEqual(
+            discussion_analysis.find_uncovered_members("<<。>><<2>>简说了。", expected),
+            (),
+        )
 
     def test_minutes_rewrite_feedback_lists_missing_members(self) -> None:
         feedback = discussion_analysis._minutes_rewrite_feedback(
@@ -2411,7 +2742,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         covered = "王小明提出核心观点。李雷补充细节并总结结论。"
         prompts: list[str] = []
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             prompts.append(prompt)
             return [missing_member, covered][len(prompts) - 1]
 
@@ -2431,7 +2762,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         uncovered = "甲提出了核心观点。乙补充了细节并总结结论。"
         prompts: list[str] = []
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             prompts.append(prompt)
             return uncovered
 
@@ -2486,6 +2817,26 @@ class DiscussionMinutesTests(unittest.TestCase):
         self.assertIn("张三", truncated)
         self.assertNotIn("未形成统一结论", truncated)
 
+    def test_truncate_minutes_keeps_marker_sentences_for_coverage(self) -> None:
+        """Sentences carrying <<name>> markers still count toward coverage selection."""
+
+        paragraph = "<<懒>>觉得当前福利还可以。" + "乙" * 290 + "。"
+        truncated = discussion_analysis.truncate_minutes(paragraph, expected=("懒",))
+        self.assertEqual(truncated, "<<懒>>觉得当前福利还可以。")
+
+    def test_sanitize_minutes_strips_unpaired_marker_brackets(self) -> None:
+        """Unclosed << fragments lose their brackets while complete markers survive."""
+
+        cleaned = discussion_analysis._sanitize_minutes_paragraph(
+            "本次围绕福利展开讨论，<<珂神神了！简认为值得尝试。第二天继续交流。"
+        )
+        self.assertNotIn("<<", cleaned)
+        self.assertIn("珂神神了！简认为值得尝试。", cleaned)
+        self.assertEqual(
+            discussion_analysis._sanitize_minutes_paragraph("<<王小明>>发言。接着补充。"),
+            "<<王小明>>发言。接着补充。",
+        )
+
     def test_summarize_topic_partial_retry_uses_participants_for_coverage(self) -> None:
         moment = datetime(2026, 9, 11, 9, 0)
         messages = {
@@ -2497,11 +2848,19 @@ class DiscussionMinutesTests(unittest.TestCase):
         candidate = discussion_analysis.TopicCandidate(
             "s:a", "议题", "摘要", (1, 2), True
         )
-        missing_member = "王小明提出了核心观点。讨论最终达成共识。"
-        covered = "王小明提出核心观点。李雷补充并总结结论。"
+        missing_member = (
+            '{"summary":"双方就议题推进节奏对立。",'
+            '"points":[{"member":"王小明","text":"王小明认为应当继续推进。"}]}'
+        )
+        covered = (
+            '{"summary":"双方就议题推进节奏对立。",'
+            '"points":[{"member":"王小明","text":"王小明认为应当继续推进。"},'
+            '{"member":"李雷","text":"李雷主张暂缓并观察后续。"}],'
+            '"conclusion":"双方同意各自保留立场。"}'
+        )
         prompts: list[str] = []
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             prompts.append(prompt)
             return [missing_member, covered][len(prompts) - 1]
 
@@ -2512,53 +2871,114 @@ class DiscussionMinutesTests(unittest.TestCase):
             request_text=scripted_request,
             participants=("王小明", "李雷"),
         )
-        self.assertEqual(result, covered)
+        self.assertEqual(
+            result,
+            discussion_analysis.TopicMinutes(
+                "双方就议题推进节奏对立。",
+                (
+                    discussion_analysis.MinutePoint(
+                        "王小明", "王小明认为应当继续推进。"
+                    ),
+                    discussion_analysis.MinutePoint("李雷", "李雷主张暂缓并观察后续。"),
+                ),
+                "双方同意各自保留立场。",
+                None,
+            ),
+        )
         self.assertIn("主要参与者名单：王小明、李雷", prompts[0])
         self.assertIn("李雷", prompts[1])
-        self.assertIn("精简概括", prompts[1])
+        self.assertIn("凝练概括", prompts[1])
 
     def test_summarize_topic_splices_when_merge_budget_cannot_fit_partials(self) -> None:
-        """Partials too large for the merge budget splice instead of looping forever."""
+        """Partials too large for the structured merge budget splice deterministically."""
 
         moment = datetime(2026, 9, 11, 9, 0)
         messages = {
             index: discussion_analysis.DiscussionMessage(
-                index, moment.replace(minute=index), "王小明", f"消息{index}内容"
+                index, moment.replace(minute=index), "王小明", "讨论内容" * 200
             )
             for index in (1, 2)
         }
         candidate = discussion_analysis.TopicCandidate(
             "s:a", "议题", "摘要", (1, 2), True
         )
-        first = "王小明分析了地图编辑器的历史渊源。参与者补充了模组生态。"
-        second = "王小明总结了游戏机制的分歧。参与者最终达成一致。"
+        first = "王小明分析了现象并给出了理由。他补充了更多细节。"
+        second = "王小明总结了分歧所在。他给出结论并致谢。"
+        merged_paragraph = "王小明继续分析这个问题。" * 24
         prompts: list[str] = []
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             prompts.append(prompt)
-            return [first, second][len(prompts) - 1]
+            return [first, second, merged_paragraph][len(prompts) - 1]
 
-        result = discussion_analysis.summarize_topic(
-            candidate,
-            messages_by_id=messages,
-            maximum_characters=545,
-            request_text=scripted_request,
-            participants=("王小明",),
+        merge_prefix_len = len(
+            discussion_analysis._structured_minutes_instruction(
+                "议题", ("王小明",), merged=True
+            )
+        ) + len("\n\n分段纪要如下：\n")
+        partial_prefix_len = (
+            len(
+                discussion_analysis._minutes_instruction(
+                    "议题", partial=True, participants=("王小明",)
+                )
+            )
+            + len("\n\n消息如下：\n")
         )
-        self.assertEqual(result, first + second)
-        # 只发起两次分段请求：归并阶段装不下任何两条分段，直接拼接降级
-        self.assertEqual(len(prompts), 2)
+        budget = merge_prefix_len + 30
+        # 分段请求仍需装得下单条超长消息（截断后成块）
+        self.assertGreater(budget - partial_prefix_len, 400)
+
+        output = StringIO()
+        with redirect_stdout(output):
+            result = discussion_analysis.summarize_topic(
+                candidate,
+                messages_by_id=messages,
+                maximum_characters=budget,
+                request_text=scripted_request,
+                participants=("王小明",),
+            )
+
+        # 两次分段请求 + 一次安全阀段落归并请求；结构化归并因超预算被跳过
+        self.assertEqual(len(prompts), 3)
+        self.assertIn("已拼接分段纪要降级", output.getvalue())
+        self.assertEqual(
+            result,
+            discussion_analysis.TopicMinutes(
+                None, (), None, merged_paragraph
+            ),
+        )
 
     def test_member_highlights_bold_names_and_assign_distinct_colors(self) -> None:
         moment = datetime(2026, 9, 11, 9, 0)
         report = discussion_analysis.DiscussionReport(
             (
                 discussion_analysis.DiscussionTopic(
-                    "t1", "议题", 2, 0, moment, moment, ("甲", "乙"),
-                    "甲提出核心观点。乙补充细节并总结。",
+                    "t1",
+                    "议题",
+                    2,
+                    0,
+                    moment,
+                    moment,
+                    ("甲", "乙"),
+                    discussion_analysis.TopicMinutes(
+                        None,
+                        (
+                            discussion_analysis.MinutePoint("甲", "甲提出核心观点。"),
+                            discussion_analysis.MinutePoint("乙", "乙补充细节并总结。"),
+                        ),
+                        None,
+                        None,
+                    ),
                 ),
                 discussion_analysis.DiscussionTopic(
-                    "t2", "议题二", 1, 5, moment, moment, ("甲",), "甲再次强调结论。"
+                    "t2",
+                    "议题二",
+                    1,
+                    5,
+                    moment,
+                    moment,
+                    ("甲",),
+                    discussion_analysis.TopicMinutes("甲再次强调结论。", (), None, None),
                 ),
             ),
             (),
@@ -2570,9 +2990,18 @@ class DiscussionMinutesTests(unittest.TestCase):
 
         self.assertEqual(set(styles), {"甲", "乙"})
         self.assertNotEqual(styles["甲"][0], styles["乙"][0])
-        self.assertIn("**甲**提出核心观点。**乙**补充细节并总结。", highlighted.topics[0].minutes)
+        minutes = highlighted.topics[0].minutes
+        self.assertEqual(minutes.points[0].member, "**甲**")
+        self.assertEqual(minutes.points[0].text, "**甲**提出核心观点。")
+        self.assertEqual(minutes.points[1].member, "**乙**")
+        self.assertEqual(minutes.points[1].text, "**乙**补充细节并总结。")
+        self.assertEqual(
+            highlighted.topics[1].minutes.summary, "**甲**再次强调结论。"
+        )
         self.assertEqual(highlighted.topics[1].participants, ("**甲**",))
-        self.assertIn("- **主要参与者**：**甲**、**乙**", highlighted.to_markdown())
+        markdown = highlighted.to_markdown()
+        self.assertIn("- **主要参与者**：**甲**、**乙**", markdown)
+        self.assertIn("- **甲**：**甲**提出核心观点。", markdown)
         self.assertIsNone(report.member_styles)
         self.assertEqual(
             discussion_analysis.bold_member_names("王小明和小明都在", ["小明", "王小明"]),
@@ -2599,6 +3028,33 @@ class DiscussionMinutesTests(unittest.TestCase):
             "路人发言。",
         )
 
+    def test_bold_member_names_skips_degenerate_names_in_prose(self) -> None:
+        """Punctuation-only and single-digit names never highlight prose characters."""
+
+        self.assertEqual(
+            discussion_analysis.bold_member_names("新出的砂金2命强度是0命的2.5倍。", ["2"]),
+            "新出的砂金2命强度是0命的2.5倍。",
+        )
+        self.assertEqual(
+            discussion_analysis.bold_member_names("心得。羽未肯定实用性。", ["。"]),
+            "心得。羽未肯定实用性。",
+        )
+        # 单字中文名不受退化署名排除约束
+        self.assertEqual(
+            discussion_analysis.bold_member_names("简认为。", ["简"]),
+            "**简**认为。",
+        )
+
+    def test_bold_member_names_highlights_degenerate_names_via_markers(self) -> None:
+        """Degenerate names highlight through explicit markers and list display."""
+
+        self.assertEqual(
+            discussion_analysis.bold_member_names("<<2>>和<<。>>都发言了。", ["2", "。"]),
+            "**2**和**。**都发言了。",
+        )
+        self.assertEqual(discussion_analysis.bold_member_names("。", ["。"]), "**。**")
+        self.assertEqual(discussion_analysis.bold_member_names("_", ["_"]), "**\\_**")
+
     def test_member_aliases_skip_conflicting_stems(self) -> None:
         self.assertEqual(
             discussion_analysis.member_aliases(["祥子(ut 不重要了健康才重要）", "nt"]),
@@ -2610,6 +3066,7 @@ class DiscussionMinutesTests(unittest.TestCase):
             discussion_analysis.member_aliases(["*new LS_Hower", "_"]),
             {"new LS_Hower": "*new LS_Hower"},
         )
+        self.assertEqual(discussion_analysis.member_aliases(["2（不打深塔）"]), {})
 
     def test_member_highlights_match_alias_with_same_color(self) -> None:
         moment = datetime(2026, 9, 11, 9, 0)
@@ -2624,7 +3081,16 @@ class DiscussionMinutesTests(unittest.TestCase):
                     moment,
                     moment,
                     (member,),
-                    f"祥子提出go语言观点。<<{member}>>补充细节。",
+                    discussion_analysis.TopicMinutes(
+                        None,
+                        (
+                            discussion_analysis.MinutePoint(
+                                member, f"<<{member}>>补充细节。"
+                            ),
+                        ),
+                        None,
+                        None,
+                    ),
                 ),
             ),
             (),
@@ -2635,17 +3101,29 @@ class DiscussionMinutesTests(unittest.TestCase):
         styles = highlighted.member_styles or {}
 
         self.assertEqual(styles["祥子"], styles[member])
-        self.assertIn("**祥子**提出go语言观点。", highlighted.topics[0].minutes)
-        self.assertIn(f"**{discussion_analysis.escape_inline_name(member)}**补充细节。", highlighted.topics[0].minutes)
+        minutes = highlighted.topics[0].minutes
+        self.assertEqual(
+            minutes.points[0].member,
+            f"**{discussion_analysis.escape_inline_name(member)}**",
+        )
+        self.assertIn(
+            f"**{discussion_analysis.escape_inline_name(member)}**补充细节。",
+            minutes.points[0].text,
+        )
+        self.assertIn(
+            f"- **{discussion_analysis.escape_inline_name(member)}**：",
+            highlighted.to_markdown(),
+        )
 
     def test_bold_member_names_escape_markdown_and_html_characters(self) -> None:
         self.assertEqual(
             discussion_analysis.bold_member_names("*new LS_Hower发言。", ["*new LS_Hower"]),
             "**\\*new LS\\_Hower**发言。",
         )
+        # 纯标点署名不再命中正文（退化署名规则），仅名单展示时按原文加粗
         self.assertEqual(
             discussion_analysis.bold_member_names("由_提出观点。", ["_"]),
-            "由**\\_**提出观点。",
+            "由_提出观点。",
         )
         self.assertEqual(
             discussion_analysis.bold_member_names("<b>老哥</b>发言。", ["<b>老哥"]),
@@ -2661,8 +3139,23 @@ class DiscussionMinutesTests(unittest.TestCase):
         report = discussion_analysis.DiscussionReport(
             (
                 discussion_analysis.DiscussionTopic(
-                    "t1", "议题", 2, 0, moment, moment, ("*new LS_Hower",),
-                    "*new LS_Hower分享教程。",
+                    "t1",
+                    "议题",
+                    2,
+                    0,
+                    moment,
+                    moment,
+                    ("*new LS_Hower",),
+                    discussion_analysis.TopicMinutes(
+                        None,
+                        (
+                            discussion_analysis.MinutePoint(
+                                "*new LS_Hower", "*new LS_Hower分享教程。"
+                            ),
+                        ),
+                        None,
+                        None,
+                    ),
                 ),
             ),
             (),
@@ -2676,7 +3169,8 @@ class DiscussionMinutesTests(unittest.TestCase):
             {"*new LS_Hower", "new LS_Hower"},
         )
         self.assertIn(
-            "**\\*new LS\\_Hower**分享教程。", highlighted.topics[0].minutes
+            "**\\*new LS\\_Hower**分享教程。",
+            highlighted.topics[0].minutes.points[0].text,
         )
 
     def test_normalize_minutes_strips_single_asterisks(self) -> None:
@@ -2713,7 +3207,7 @@ class DiscussionMinutesTests(unittest.TestCase):
             for index in range(6)
         )
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             if "候选议题如下" in prompt:
                 payload = prompt.split("候选议题如下：\n", 1)[1]
                 return json.dumps(
@@ -2790,7 +3284,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         invalid_response = "抱歉，我无法按要求数据格式回答。"
         merge_prompts: list[str] = []
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             if "候选议题如下" in prompt:
                 merge_prompts.append(prompt)
                 payload = prompt.split("候选议题如下：\n", 1)[1]
@@ -2837,6 +3331,11 @@ class DiscussionMinutesTests(unittest.TestCase):
                     },
                     ensure_ascii=False,
                 )
+            if "观点条目" in prompt:
+                return (
+                    '{"summary":"参与者围绕话题交换了意见。",'
+                    '"points":[{"member":"甲","text":"甲概括了相关观点。"}]}'
+                )
             if "自然段" in prompt:
                 return "甲提出观点并作出总结。乙补充事实并反思讨论结果。"
             raise AssertionError(f"未预期的请求：{prompt[:60]}")
@@ -2879,7 +3378,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
         segment_prompts: list[str] = []
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             if "start_line" in prompt:
                 segment_prompts.append(prompt)
                 if len(segment_prompts) == 1:
@@ -2901,6 +3400,11 @@ class DiscussionMinutesTests(unittest.TestCase):
                         ]
                     },
                     ensure_ascii=False,
+                )
+            if "观点条目" in prompt:
+                return (
+                    '{"summary":"参与者围绕话题交换了意见。",'
+                    '"points":[{"member":"甲","text":"甲概括了相关观点。"}]}'
                 )
             if "自然段" in prompt:
                 return "甲提出观点并作出总结。乙补充事实并反思讨论结果。"
@@ -2933,7 +3437,7 @@ class DiscussionMinutesTests(unittest.TestCase):
             for index in range(2)
         )
 
-        def scripted_request(prompt: str) -> str:
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
             if "候选议题如下" in prompt:
                 payload = prompt.split("候选议题如下：\n", 1)[1]
                 return json.dumps(
@@ -2979,12 +3483,14 @@ class DiscussionMinutesTests(unittest.TestCase):
         self.assertEqual(len(report.topics), 1)
         self.assertEqual(report.topics[0].message_count, 2)
         minutes = report.topics[0].minutes
-        self.assertIn("主要发言摘录：", minutes)
-        self.assertIn("[09:00] **甲**：消息0内容", minutes)
-        self.assertIn("[10:00] **甲**：消息1内容", minutes)
-        self.assertNotIn("模型纪要生成失败", minutes)
-        self.assertNotIn("响应开头", minutes)
-        self.assertNotIn("抱歉", minutes)
+        fallback = minutes.fallback_text or ""
+        self.assertIn("主要发言摘录：", fallback)
+        self.assertIn("[09:00] **甲**：消息0内容", fallback)
+        self.assertIn("[10:00] **甲**：消息1内容", fallback)
+        self.assertNotIn("模型纪要生成失败", fallback)
+        self.assertNotIn("响应开头", fallback)
+        self.assertNotIn("抱歉", fallback)
+        self.assertEqual(minutes.points, ())
 
     @staticmethod
     def _two_segment_topic_source() -> tuple:
@@ -2994,15 +3500,24 @@ class DiscussionMinutesTests(unittest.TestCase):
                 index,
                 timestamp.replace(hour=9 + index),
                 "成员",
-                f"{'甲段' if index == 0 else '乙段'}{'讨论内容' * 30}",
+                f"{'甲段' if index == 0 else '乙段'}{'讨论内容' * 100}",
                 "",
             )
             for index in range(2)
         )
 
     @staticmethod
-    def _topic_scripted_request(minutes_by_marker: dict[str, str], refusal: str):
-        def scripted_request(prompt: str) -> str:
+    def _topic_scripted_request(
+        minutes_by_marker: dict[str, str],
+        refusal: str,
+        structured_merge: str | None = None,
+    ):
+        def scripted_request(prompt: str, *, json_output: bool = False) -> str:
+            if "观点条目" in prompt:
+                # 最终结构化撰写/归并请求：归并可注入合法结构化响应
+                if structured_merge is not None and "分段纪要如下" in prompt:
+                    return structured_merge
+                return refusal
             if "分段纪要如下" in prompt:
                 return refusal
             if "讨论纪要" in prompt:
@@ -3049,20 +3564,41 @@ class DiscussionMinutesTests(unittest.TestCase):
 
         source = self._two_segment_topic_source()
         paragraph = "乙段讨论了游戏机制的核心分歧。参与者最终达成一致。"
-        scripted = self._topic_scripted_request({"乙段": paragraph}, "抱歉，我无法回答。")
+        structured_merge = (
+            '{"summary":"参与者围绕分段议题交换了意见。",'
+            '"points":[{"member":"成员","text":"成员概括了分段观点。"}]}'
+        )
+        scripted = self._topic_scripted_request(
+            {"乙段": paragraph},
+            "抱歉，我无法回答。",
+            structured_merge=structured_merge,
+        )
 
         output = StringIO()
         with redirect_stdout(output):
             report = discussion_analysis.analyze_discussion_minutes(
                 source,
                 maximum_topics=5,
-                maximum_input_characters=600,
+                maximum_input_characters=1300,
                 request_text=scripted,
             )
 
         self.assertIn("已跳过该分段", output.getvalue())
         self.assertEqual(len(report.topics), 1)
-        self.assertEqual(report.topics[0].minutes, paragraph)
+        # analyze_discussion_minutes 末尾统一做成员加粗，观点条目同样生效
+        self.assertEqual(
+            report.topics[0].minutes,
+            discussion_analysis.TopicMinutes(
+                "参与者围绕分段议题交换了意见。",
+                (
+                    discussion_analysis.MinutePoint(
+                        "**成员**", "**成员**概括了分段观点。"
+                    ),
+                ),
+                None,
+                None,
+            ),
+        )
 
     def test_merge_failure_splices_validated_partial_minutes(self) -> None:
         """A failed merge request falls back to joining validated partials."""
@@ -3079,16 +3615,21 @@ class DiscussionMinutesTests(unittest.TestCase):
             report = discussion_analysis.analyze_discussion_minutes(
                 source,
                 maximum_topics=5,
-                maximum_input_characters=600,
+                maximum_input_characters=1300,
                 request_text=scripted,
             )
 
         self.assertIn("已拼接分段纪要降级", output.getvalue())
         self.assertEqual(len(report.topics), 1)
         minutes = report.topics[0].minutes
-        self.assertEqual(minutes, first + second)
-        self.assertLessEqual(len(minutes), discussion_analysis.MAX_MINUTES_CHARACTERS)
-        self.assertNotIn("抱歉", minutes)
+        self.assertEqual(minutes.points, ())
+        fallback = minutes.fallback_text or ""
+        self.assertEqual(fallback, first + second)
+        self.assertLessEqual(
+            len(fallback),
+            discussion_analysis.MINUTES_MAX_TOTAL_CHARACTERS,
+        )
+        self.assertNotIn("抱歉", fallback)
 
     def test_fallback_minutes_excerpt_balances_members_and_truncates(self) -> None:
         moment = datetime(2026, 9, 11, 14, 22)
@@ -3206,7 +3747,11 @@ class DiscussionMinutesTests(unittest.TestCase):
                     ensure_ascii=False,
                 ), None
             if "讨论纪要" in prompt:
-                return "甲提出核心观点并总结方向。乙补充事实并反思结论。", None
+                return (
+                    '{"summary":"各方围绕议题交换了意见。",'
+                    '"points":[{"member":"甲","text":"甲提出核心观点并总结方向。"},'
+                    '{"member":"乙","text":"乙补充事实并反思结论。"}]}'
+                ), None
             if "群像速览" in prompt:
                 return "- **整体画像**：测试概括。", None
             member = re.search(r"(?m)^- (\S+)（本批次", prompt)
@@ -3341,15 +3886,23 @@ class DiscussionMinutesTests(unittest.TestCase):
                 raise RuntimeError("start_line 必须是整数")
             return response
 
+        def bad_response(prompt: str, *, json_output: bool = False) -> str:
+            prompts.append(prompt)
+            return "bad"
+
+        def record_response(prompt: str, *, json_output: bool = False) -> str:
+            prompts.append(prompt)
+            return next(responses)
+
         with self.assertRaisesRegex(RuntimeError, "start_line 必须是整数"):
             discussion_analysis._validated_request(
                 "原始提示",
-                request_text=lambda prompt: (prompts.append(prompt), "bad")[1],
+                request_text=bad_response,
                 parser=parser,
             )
         result = discussion_analysis._validated_request(
             "原始提示",
-            request_text=lambda prompt: (prompts.append(prompt), next(responses))[1],
+            request_text=record_response,
             parser=parser,
         )
 
@@ -3369,10 +3922,14 @@ class DiscussionMinutesTests(unittest.TestCase):
         def parser(response: str) -> str:
             raise RuntimeError("响应不是 JSON 对象")
 
+        def bad_response(prompt: str, *, json_output: bool = False) -> str:
+            prompts.append(prompt)
+            return "坏响应"
+
         with self.assertRaisesRegex(RuntimeError, "响应不是 JSON 对象"):
             discussion_analysis._validated_request(
                 "原始提示",
-                request_text=lambda prompt: (prompts.append(prompt), "坏响应")[1],
+                request_text=bad_response,
                 parser=parser,
             )
 
@@ -3391,9 +3948,12 @@ class DiscussionMinutesTests(unittest.TestCase):
                 raise RuntimeError("结构非法")
             return response
 
+        def next_response(prompt: str, *, json_output: bool = False) -> str:
+            return next(responses)
+
         result = discussion_analysis._validated_request(
             "原始提示",
-            request_text=lambda prompt: next(responses),
+            request_text=next_response,
             parser=parser,
             on_rejected=lambda prompt, response: seen.append((prompt, response)),
         )
@@ -3415,7 +3975,7 @@ class DiscussionMinutesTests(unittest.TestCase):
 
         seen: list[tuple[str, str]] = []
 
-        def failing_request(_prompt: str) -> str:
+        def failing_request(prompt: str, *, json_output: bool = False) -> str:
             raise RuntimeError("网络失败")
 
         with self.assertRaisesRegex(RuntimeError, "网络失败"):
@@ -3547,12 +4107,40 @@ class HtmlRenderingTests(unittest.TestCase):
         self.assertIn("测试群 · 群员画像", rendered)
         self.assertIn("member-card", rendered)
 
+    def test_discussion_rendering_ships_name_badge_and_truncation_logic(self) -> None:
+        """HTML 模板需内置备注徽标样式与超长姓名截断的显示层逻辑。"""
+
+        rendered = analyze_transcript.render_html(
+            "## 纪要\n\n### 议题\n\n- **时间范围**：2026-09-11 09:00 至 2026-09-11 10:00\n"
+            "- **主要参与者**：**甲**\n\n总览。\n\n- **甲**：甲的观点。\n",
+            chat_name="测试群",
+        )
+
+        self.assertIn("member-name-tag", rendered)
+        self.assertIn("主要参与者", rendered)
+
     def test_discussion_chart_is_structured_before_portrait_cards(self) -> None:
         report = discussion_analysis.DiscussionReport(
             (
                 discussion_analysis.DiscussionTopic(
-                    "t1", "测试议题", 2, 0, datetime(2026, 9, 11, 9),
-                    datetime(2026, 9, 11, 10), ("甲",), "甲提出观点并作出总结。乙补充信息并支持讨论。"
+                    "t1",
+                    "测试议题",
+                    2,
+                    0,
+                    datetime(2026, 9, 11, 9),
+                    datetime(2026, 9, 11, 10),
+                    ("甲",),
+                    discussion_analysis.TopicMinutes(
+                        None,
+                        (
+                            discussion_analysis.MinutePoint(
+                                "甲", "甲提出观点并作出总结。"
+                            ),
+                            discussion_analysis.MinutePoint("乙", "乙补充信息并支持讨论。"),
+                        ),
+                        None,
+                        None,
+                    ),
                 ),
             ),
             ("09-11 09:00", "09-11 10:00"),
@@ -3579,9 +4167,22 @@ class HtmlRenderingTests(unittest.TestCase):
         base = discussion_analysis.DiscussionReport(
             (
                 discussion_analysis.DiscussionTopic(
-                    "t1", "测试议题", 2, 0, datetime(2026, 9, 11, 9),
-                    datetime(2026, 9, 11, 10), ("甲", "乙"),
-                    "甲提出核心观点。乙补充信息并作出总结。",
+                    "t1",
+                    "测试议题",
+                    2,
+                    0,
+                    datetime(2026, 9, 11, 9),
+                    datetime(2026, 9, 11, 10),
+                    ("甲", "乙"),
+                    discussion_analysis.TopicMinutes(
+                        None,
+                        (
+                            discussion_analysis.MinutePoint("甲", "甲提出核心观点。"),
+                            discussion_analysis.MinutePoint("乙", "乙补充信息并作出总结。"),
+                        ),
+                        None,
+                        None,
+                    ),
                 ),
             ),
             ("09-11 09:00", "09-11 10:00"),

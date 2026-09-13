@@ -1689,7 +1689,9 @@ def analyze_all_members(
                     )
                 return response
 
-            def request_discussion(prompt: str) -> str:
+            def request_discussion(
+                prompt: str, *, json_output: bool = False
+            ) -> str:
                 nonlocal discussion_request_count
                 with discussion_request_lock:
                     discussion_request_count += 1
@@ -1711,6 +1713,7 @@ def analyze_all_members(
                         api_key=api_key,
                         max_tokens=request_max_tokens,
                         timeout_seconds=timeout_seconds,
+                        json_output=json_output,
                         max_retries=max_retries,
                         retry_delay_seconds=retry_delay_seconds,
                         stage_label=label,
@@ -1961,6 +1964,7 @@ def render_html(
     .discussion-minutes {{ margin: 2.5rem 0; padding: 24px 26px; background: #fbf7ee; border: 1px solid #ead9bd; border-radius: 14px; break-inside: avoid; page-break-inside: avoid; }}
     .discussion-minutes h2 {{ margin-top: 0; }}
     .discussion-minutes .member-name {{ padding: 0 3px; border-radius: 4px; }}
+    .discussion-minutes .member-name-tag {{ display: inline-block; margin-left: 4px; padding: 0 6px; color: #527084; background: #eef3f6; border: 1px solid #d3e1e7; border-radius: 999px; font-size: .72rem; font-weight: 500; line-height: 1.6; vertical-align: 1px; }}
     .discussion-chart {{ min-height: 280px; margin: 1rem 0; }}
     .discussion-topic {{ margin: 1.4rem 0 0; padding: 17px 18px; background: #fffefd; border-left: 3px solid #c17b3f; border-radius: 0 10px 10px 0; break-inside: avoid; page-break-inside: avoid; }}
     .discussion-topic h3 {{ margin-top: 0; }}
@@ -2085,11 +2089,33 @@ def render_html(
         const chartData = {chart_payload};
         const memberStyles = (chartData && chartData.member_styles) || {{}};
         Array.from(discussion.querySelectorAll("strong")).forEach((strong) => {{
-          const style = memberStyles[strong.textContent.trim()];
-          if (style) {{
-            strong.classList.add("member-name");
-            strong.style.color = style.color;
-            strong.style.backgroundColor = style.background;
+          const full = strong.textContent.trim();
+          const style = memberStyles[full];
+          if (!style) return;
+          strong.classList.add("member-name");
+          strong.style.color = style.color;
+          strong.style.backgroundColor = style.background;
+          const line = strong.closest("li");
+          if (line && line.textContent.includes("主要参与者")) return;
+          const paren = full.search(/[（(]/);
+          let stem = full;
+          let tag = "";
+          if (paren >= 0) {{
+            stem = full.slice(0, paren);
+            const tail = full.slice(paren + 1);
+            const closing = tail.endsWith("）") || tail.endsWith(")") ? tail.length - 1 : tail.length;
+            tag = tail.slice(0, closing).trim();
+          }}
+          if (Array.from(stem).length > 8) {{
+            stem = Array.from(stem).slice(0, 8).join("") + "…";
+            strong.title = full;
+          }}
+          if (stem !== full) strong.textContent = stem;
+          if (tag) {{
+            const badge = document.createElement("span");
+            badge.className = "member-name-tag";
+            badge.textContent = tag;
+            strong.appendChild(badge);
           }}
         }});
         if (!chartData || !window.echarts) {{
