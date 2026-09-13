@@ -57,6 +57,32 @@ class StreamDebugTests(unittest.TestCase):
         self.assertIn("流式调试完成", output.getvalue())
         self.assertIn("内容预览", output.getvalue())
 
+    def test_redirected_output_stays_plain(self) -> None:
+        """Redirected debug output must not contain CR or ANSI escape sequences."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            sample = root / "样本.md"
+            sample.write_text(TRANSCRIPT, encoding="utf-8")
+            env_file = root / ".env"
+            env_file.write_text(ENV_TEXT, encoding="utf-8")
+            args = stream_debug.build_argument_parser().parse_args(
+                ["--input", str(sample), "--env-file", str(env_file)]
+            )
+            with patch.object(
+                analyze_transcript,
+                "request_portraits",
+                return_value=("### 甲\n- 概括", "stop"),
+            ):
+                output = StringIO()
+                with redirect_stdout(output):
+                    stream_debug.run_debug(args)
+
+        rendered = output.getvalue()
+        self.assertNotIn("\r", rendered)
+        self.assertNotIn("\x1b[", rendered)
+        self.assertIn("流式调试完成", rendered)
+
     def test_missing_sample_fails_before_any_request(self) -> None:
         """A missing transcript must abort before contacting the LLM."""
 

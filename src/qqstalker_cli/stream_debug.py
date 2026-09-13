@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from src.qqstalker_cli import analyze_transcript, contextual_analysis
+from src.qqstalker_cli.llm_progress import create_llm_progress_reporter
 
 DEFAULT_DEBUG_INPUT = Path("exports/20260911194123_消息记录.md")
 PREVIEW_CHARACTERS = 200
@@ -110,28 +111,30 @@ def run_debug(args: argparse.Namespace) -> tuple[str, str | None, float, int]:
     )
     attempt_counter: list[int] = []
     started = time.monotonic()
-    content, finish_reason = analyze_transcript.request_portraits(
-        prompt,
-        base_url=analyze_transcript.required_setting("LLM_BASE_URL"),
-        model=analyze_transcript.required_setting("LLM_MODEL"),
-        api_key=analyze_transcript.required_setting("LLM_API_KEY"),
-        max_tokens=analyze_transcript.positive_integer_setting(
-            "LLM_MAX_TOKENS", analyze_transcript.DEFAULT_MAX_TOKENS
-        ),
-        timeout_seconds=float(
-            analyze_transcript.positive_integer_setting(
-                "LLM_TIMEOUT_SECONDS", int(analyze_transcript.DEFAULT_TIMEOUT_SECONDS)
-            )
-        ),
-        max_retries=analyze_transcript.nonnegative_integer_setting(
-            "LLM_MAX_RETRIES", analyze_transcript.DEFAULT_MAX_RETRIES
-        ),
-        retry_delay_seconds=analyze_transcript.positive_float_setting(
-            "LLM_RETRY_DELAY_SECONDS", analyze_transcript.DEFAULT_RETRY_DELAY_SECONDS
-        ),
-        stage_label="流式调试",
-        attempt_counter=attempt_counter,
-    )
+    with create_llm_progress_reporter() as reporter:
+        content, finish_reason = analyze_transcript.request_portraits(
+            prompt,
+            base_url=analyze_transcript.required_setting("LLM_BASE_URL"),
+            model=analyze_transcript.required_setting("LLM_MODEL"),
+            api_key=analyze_transcript.required_setting("LLM_API_KEY"),
+            max_tokens=analyze_transcript.positive_integer_setting(
+                "LLM_MAX_TOKENS", analyze_transcript.DEFAULT_MAX_TOKENS
+            ),
+            timeout_seconds=float(
+                analyze_transcript.positive_integer_setting(
+                    "LLM_TIMEOUT_SECONDS", int(analyze_transcript.DEFAULT_TIMEOUT_SECONDS)
+                )
+            ),
+            max_retries=analyze_transcript.nonnegative_integer_setting(
+                "LLM_MAX_RETRIES", analyze_transcript.DEFAULT_MAX_RETRIES
+            ),
+            retry_delay_seconds=analyze_transcript.positive_float_setting(
+                "LLM_RETRY_DELAY_SECONDS", analyze_transcript.DEFAULT_RETRY_DELAY_SECONDS
+            ),
+            stage_label="流式调试",
+            attempt_counter=attempt_counter,
+            reporter=reporter,
+        )
     elapsed_seconds = time.monotonic() - started
     attempts = attempt_counter[0] if attempt_counter else 1
     print(
