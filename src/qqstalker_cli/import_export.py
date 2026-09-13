@@ -365,18 +365,36 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
 
     if not json_path.is_file():
         raise FileNotFoundError(f"JSON export does not exist: {json_path}")
-    if not images_dir.is_dir():
-        raise FileNotFoundError(f"Image resources directory does not exist: {images_dir}")
 
     LOGGER.info("Reading JSON export: %s", json_path.resolve())
     read_started = time.monotonic()
     source_bytes = json_path.read_bytes()
     source_sha256 = hashlib.sha256(source_bytes).hexdigest()
     LOGGER.info(
-        "Read %d bytes in %.2fs; validating export schema.",
+        "Read %d bytes in %.2fs; checking import history.",
         len(source_bytes),
         time.monotonic() - read_started,
     )
+
+    LOGGER.info("Creating database tables if needed.")
+    SQLModel.metadata.create_all(engine)
+    LOGGER.info("Database tables are ready.")
+
+    with Session(engine) as session:
+        recorded_batch = session.exec(
+            select(ImportBatch).where(
+                ImportBatch.source_path == str(json_path.resolve()),
+                ImportBatch.source_sha256 == source_sha256,
+            )
+        ).first()
+        if recorded_batch and recorded_batch.completed_at:
+            LOGGER.info("This exact export was already imported; skipping file entirely.")
+            return 0, 0
+
+    if not images_dir.is_dir():
+        raise FileNotFoundError(f"Image resources directory does not exist: {images_dir}")
+
+    LOGGER.info("Validating export schema.")
     validation_started = time.monotonic()
     export = QQChatExport.model_validate(orjson.loads(source_bytes))
     LOGGER.info(
@@ -384,10 +402,6 @@ def synchronize_export(json_path: Path, images_dir: Path, engine: Engine) -> tup
         len(export.messages),
         time.monotonic() - validation_started,
     )
-
-    LOGGER.info("Creating database tables if needed.")
-    SQLModel.metadata.create_all(engine)
-    LOGGER.info("Database tables are ready.")
 
     with Session(engine) as session, session.begin():
         peer_uid = (

@@ -1,13 +1,16 @@
 """Tests for QQChatExporter archive discovery and sequential imports."""
 
+from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from typing import cast
 import unittest
 from unittest.mock import call, patch
 
 from sqlalchemy import Engine
 from src.qqstalker_cli import import_export
+from src.qqstalker_core.schemas.qq_export import QQChatExport
 
 
 class ExportDiscoveryTests(unittest.TestCase):
@@ -52,3 +55,59 @@ class SequentialImportTests(unittest.TestCase):
                 call(json_paths[1], images_dir, engine),
             ],
         )
+
+
+class SkipAlreadyImportedTests(unittest.TestCase):
+    def write_export(self, temporary_directory: str) -> Path:
+        json_path = Path(temporary_directory) / "group.json"
+        json_path.write_bytes(b'{"messages": []}')
+        return json_path
+
+    def test_skips_parsing_when_an_identical_export_was_already_imported(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            json_path = self.write_export(temporary_directory)
+            engine = cast(Engine, object())
+            recorded_batch = SimpleNamespace(completed_at=datetime.now(UTC))
+
+            with (
+                patch("src.qqstalker_cli.import_export.Session") as session_factory,
+                patch.object(import_export.SQLModel.metadata, "create_all"),
+                patch.object(
+                    import_export.QQChatExport,
+                    "model_validate",
+                    side_effect=AssertionError("already imported exports must not be parsed"),
+                ),
+            ):
+                session = session_factory.return_value.__enter__.return_value
+                session.exec.return_value.first.return_value = recorded_batch
+
+                imported, skipped = import_export.synchronize_export(
+                    json_path,
+                    Path(temporary_directory) / "missing-images",
+                    engine,
+                )
+
+        self.assertEqual((imported, skipped), (0, 0))
+
+    def test_proceeds_when_no_completed_batch_was_recorded(self) -> None:
+        for recorded_batch in (None, SimpleNamespace(completed_at=None)):
+            with self.subTest(recorded_batch=recorded_batch):
+                with TemporaryDirectory() as temporary_directory:
+                    json_path = self.write_export(temporary_directory)
+                    engine = cast(Engine, object())
+
+                    with (
+                        patch("src.qqstalker_cli.import_export.Session") as session_factory,
+                        patch.object(import_export.SQLModel.metadata, "create_all"),
+                    ):
+                        session = session_factory.return_value.__enter__.return_value
+                        session.exec.return_value.first.return_value = recorded_batch
+
+                        with self.assertRaisesRegex(
+                            FileNotFoundError, "Image resources directory"
+                        ):
+                            import_export.synchronize_export(
+                                json_path,
+                                Path(temporary_directory) / "missing-images",
+                                engine,
+                            )
