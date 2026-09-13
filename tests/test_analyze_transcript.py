@@ -2234,6 +2234,175 @@ class DiscussionMinutesTests(unittest.TestCase):
                 "任意提示", request_text=lambda _prompt: unsafe
             )
 
+    def test_find_uncovered_members_matches_names_aliases_and_boundaries(self) -> None:
+        """Coverage matching reuses the highlight rules for aliases and boundaries."""
+
+        missing = discussion_analysis.find_uncovered_members(
+            "王小明提出了核心观点。nt 也表示附和。break 与 continue 不算命中。",
+            ("王小明(小组长)", "nt", "李雷"),
+        )
+        self.assertEqual(missing, ("李雷",))
+
+        # 别名与其他成员全名冲突时放弃别名，只认完整群名片
+        conflict = discussion_analysis.find_uncovered_members(
+            "祥子说了一句。", ("祥子(备注)", "祥子")
+        )
+        self.assertEqual(conflict, ("祥子(备注)",))
+
+        self.assertEqual(discussion_analysis.find_uncovered_members("任意文本。", ()), ())
+
+    def test_minutes_rewrite_feedback_lists_missing_members(self) -> None:
+        feedback = discussion_analysis._minutes_rewrite_feedback(
+            discussion_analysis.MemberCoverageError(("李雷", "韩梅梅"))
+        )
+        self.assertIn("李雷、韩梅梅", feedback)
+        self.assertIn("精简概括", feedback)
+        self.assertIn("虚构", feedback)
+
+        length_feedback = discussion_analysis._minutes_rewrite_feedback(
+            RuntimeError("讨论纪要超过 300 字上限（当前 320 字）")
+        )
+        self.assertIn("保留全部主要成员的核心观点与讨论结果", length_feedback)
+        self.assertNotIn("遗漏了主要参与者", length_feedback)
+
+    def test_minutes_instruction_requires_participant_coverage(self) -> None:
+        named = discussion_analysis._minutes_instruction(
+            "议题", partial=True, participants=("王小明", "李雷")
+        )
+        self.assertIn("主要参与者名单：王小明、李雷", named)
+        self.assertIn("逐一提及", named)
+        self.assertIn("概括性转述", named)
+        self.assertNotIn("按时间顺序", named)
+
+        plain = discussion_analysis._minutes_instruction("议题", partial=False)
+        self.assertIn("逐一提及", plain)
+        self.assertIn("概括性转述", plain)
+        self.assertNotIn("主要参与者名单", plain)
+        self.assertIn("压缩归纳为一段最终纪要", plain)
+
+    def test_bounded_minutes_rewrites_until_participants_covered(self) -> None:
+        missing_member = "王小明提出了核心观点。讨论最终达成共识。"
+        covered = "王小明提出核心观点。李雷补充细节并总结结论。"
+        prompts: list[str] = []
+
+        def scripted_request(prompt: str) -> str:
+            prompts.append(prompt)
+            return [missing_member, covered][len(prompts) - 1]
+
+        result = discussion_analysis._bounded_minutes(
+            "任意提示",
+            request_text=scripted_request,
+            expected=("王小明", "李雷"),
+        )
+        self.assertEqual(result, covered)
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("李雷", prompts[1])
+        self.assertIn("精简概括", prompts[1])
+
+    def test_bounded_minutes_accepts_truncated_last_resort_without_coverage(self) -> None:
+        """Exhausted coverage rewrites still end in the deterministic salvage."""
+
+        uncovered = "甲提出了核心观点。乙补充了细节并总结结论。"
+        prompts: list[str] = []
+
+        def scripted_request(prompt: str) -> str:
+            prompts.append(prompt)
+            return uncovered
+
+        result = discussion_analysis._bounded_minutes(
+            "任意提示",
+            request_text=scripted_request,
+            expected=("王小明",),
+        )
+        self.assertEqual(result, uncovered)
+        self.assertEqual(
+            len(prompts), discussion_analysis.MINUTES_REQUEST_ATTEMPTS + 1
+        )
+
+    def test_truncate_minutes_prefers_sentences_covering_missing_members(self) -> None:
+        body = "王小明详细阐述了自己对游戏风格的看法并补充了理由。"
+        tail = "李雷总结了讨论并给出最终结论。"
+        paragraph = body * 12 + tail
+
+        truncated = discussion_analysis.truncate_minutes(
+            paragraph, expected=("王小明", "李雷")
+        )
+        self.assertLessEqual(len(truncated), discussion_analysis.MAX_MINUTES_CHARACTERS)
+        self.assertIn("李雷总结了讨论", truncated)
+        self.assertTrue(truncated.endswith("。"))
+
+        unchanged = discussion_analysis.truncate_at_sentence(
+            paragraph, discussion_analysis.MAX_MINUTES_CHARACTERS
+        )
+        self.assertEqual(discussion_analysis.truncate_minutes(paragraph), unchanged)
+        self.assertEqual(
+            discussion_analysis.truncate_minutes(paragraph, expected=("王小明",)),
+            unchanged,
+        )
+
+    def test_summarize_topic_partial_retry_uses_participants_for_coverage(self) -> None:
+        moment = datetime(2026, 9, 11, 9, 0)
+        messages = {
+            index: discussion_analysis.DiscussionMessage(
+                index, moment.replace(minute=index), member, f"消息{index}内容"
+            )
+            for index, member in ((1, "王小明"), (2, "李雷"))
+        }
+        candidate = discussion_analysis.TopicCandidate(
+            "s:a", "议题", "摘要", (1, 2), True
+        )
+        missing_member = "王小明提出了核心观点。讨论最终达成共识。"
+        covered = "王小明提出核心观点。李雷补充并总结结论。"
+        prompts: list[str] = []
+
+        def scripted_request(prompt: str) -> str:
+            prompts.append(prompt)
+            return [missing_member, covered][len(prompts) - 1]
+
+        result = discussion_analysis.summarize_topic(
+            candidate,
+            messages_by_id=messages,
+            maximum_characters=2000,
+            request_text=scripted_request,
+            participants=("王小明", "李雷"),
+        )
+        self.assertEqual(result, covered)
+        self.assertIn("主要参与者名单：王小明、李雷", prompts[0])
+        self.assertIn("李雷", prompts[1])
+        self.assertIn("精简概括", prompts[1])
+
+    def test_summarize_topic_splices_when_merge_budget_cannot_fit_partials(self) -> None:
+        """Partials too large for the merge budget splice instead of looping forever."""
+
+        moment = datetime(2026, 9, 11, 9, 0)
+        messages = {
+            index: discussion_analysis.DiscussionMessage(
+                index, moment.replace(minute=index), "王小明", f"消息{index}内容"
+            )
+            for index in (1, 2)
+        }
+        candidate = discussion_analysis.TopicCandidate(
+            "s:a", "议题", "摘要", (1, 2), True
+        )
+        first = "王小明分析了地图编辑器的历史渊源。参与者补充了模组生态。"
+        second = "王小明总结了游戏机制的分歧。参与者最终达成一致。"
+        prompts: list[str] = []
+
+        def scripted_request(prompt: str) -> str:
+            prompts.append(prompt)
+            return [first, second][len(prompts) - 1]
+
+        result = discussion_analysis.summarize_topic(
+            candidate,
+            messages_by_id=messages,
+            maximum_characters=510,
+            request_text=scripted_request,
+            participants=("王小明",),
+        )
+        self.assertEqual(result, first + second)
+        # 只发起两次分段请求：归并阶段装不下任何两条分段，直接拼接降级
+        self.assertEqual(len(prompts), 2)
+
     def test_member_highlights_bold_names_and_assign_distinct_colors(self) -> None:
         moment = datetime(2026, 9, 11, 9, 0)
         report = discussion_analysis.DiscussionReport(
@@ -2760,7 +2929,7 @@ class DiscussionMinutesTests(unittest.TestCase):
             report = discussion_analysis.analyze_discussion_minutes(
                 source,
                 maximum_topics=5,
-                maximum_input_characters=500,
+                maximum_input_characters=600,
                 request_text=scripted,
             )
 

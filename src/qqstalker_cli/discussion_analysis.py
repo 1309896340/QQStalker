@@ -182,6 +182,22 @@ def bold_member_names(text: str, roster: Sequence[str]) -> str:
     return pattern.sub(replace, text)
 
 
+def find_uncovered_members(text: str, expected: Sequence[str]) -> tuple[str, ...]:
+    """Return expected members whose names or aliases never surface in text."""
+
+    names = [name for name in dict.fromkeys(expected) if name]
+    if not names:
+        return ()
+    surfaces: dict[str, str] = {name: name for name in names}
+    surfaces.update(member_aliases(names))
+    covered = {
+        owner
+        for surface, owner in surfaces.items()
+        if re.search(_bounded_name_pattern(surface), text)
+    }
+    return tuple(name for name in names if name not in covered)
+
+
 def member_highlight_styles(names: Sequence[str]) -> dict[str, tuple[str, str]]:
     """Assign each name a deterministic high-distinction text/background pair."""
 
@@ -770,15 +786,30 @@ def merge_topic_candidates(
     return current
 
 
-def _minutes_instruction(title: str, *, partial: bool) -> str:
+def _minutes_instruction(
+    title: str, *, partial: bool, participants: Sequence[str] = ()
+) -> str:
     scope = "这一时间片" if partial else "整个议题"
     merge_clause = (
         ""
         if partial
         else "请把输入中的多个分段纪要压缩归纳为一段最终纪要，而不是按顺序拼接全部分段内容。"
     )
+    roster = [name for name in dict.fromkeys(participants) if name]
+    if roster:
+        coverage_clause = (
+            f"主要参与者名单：{'、'.join(roster)}。"
+            "名单中出现在本次输入里的每名成员都必须逐一提及并概括其观点；"
+            "字数紧张时用概括性转述缩短表述，而不是省略成员或照抄长句。"
+        )
+    else:
+        coverage_clause = (
+            "纪要必须逐一提及本次输入中出现过的每名主要参与者并概括其观点；"
+            "字数紧张时用概括性转述缩短表述，而不是省略成员或照抄长句。"
+        )
     return f"""为议题“{title}”撰写{scope}的讨论纪要，只输出一个由多个简明句子组成的自然段，长度控制在 200~300 字。
-{merge_clause}围绕议题的核心观点、关键分歧与讨论结果归纳成段：合并同类发言，省略寒暄、重复与无关细节，不要按时间顺序逐条转述每个人的发言。
+{merge_clause}围绕议题的核心观点、关键分歧与讨论结果归纳成段：合并同类发言，省略寒暄、重复与无关细节。
+{coverage_clause}
 提及成员时必须逐字使用消息行方括号内的完整署名，不要缩写、省略或改写；每次提及成员时用“<<完整署名>>”的格式标注该成员。
 纪要是纯文本自然段：除上述 <<完整署名>> 标记外，不要输出任何 Markdown 或强调符号，不要使用星号、下划线、方括号、引用块等标记包裹姓名或内容。
 核心观点与关键分歧必须说明是谁提出的；只有在 @、引用、点名或语义明确的连续问答提供直接证据时，才能写认同或否认谁，否则不要虚构立场关系，可写未直接回应他人观点。
@@ -889,10 +920,48 @@ def truncate_at_sentence(text: str, limit: int) -> str:
     return cut[: sentence_ends[-1]] if sentence_ends else cut
 
 
-def truncate_minutes(paragraph: str) -> str:
-    """Deterministically cap a paragraph at the limit on sentence boundaries."""
+def _split_complete_sentences(paragraph: str) -> tuple[str, ...]:
+    """Split at sentence ends, keeping the ends and dropping a trailing fragment."""
 
-    return truncate_at_sentence(paragraph, MAX_MINUTES_CHARACTERS)
+    sentences: list[str] = []
+    start = 0
+    for match in SENTENCE_END_PATTERN.finditer(paragraph):
+        end = match.end()
+        if end > start:
+            sentences.append(paragraph[start:end])
+        start = end
+    return tuple(sentences)
+
+
+def truncate_minutes(paragraph: str, expected: Sequence[str] = ()) -> str:
+    """Deterministically cap a paragraph, preferring sentences that add coverage."""
+
+    prefix = truncate_at_sentence(paragraph, MAX_MINUTES_CHARACTERS)
+    wanted = [name for name in dict.fromkeys(expected) if name]
+    if not wanted or not find_uncovered_members(prefix, wanted):
+        return prefix
+    sentences = _split_complete_sentences(paragraph)
+    budget = MAX_MINUTES_CHARACTERS
+    covered: set[str] = set()
+    picked: set[int] = set()
+    # 第一遍按原序保住提及尚未覆盖成员的句子，第二遍再回填其余句子。
+    for index, sentence in enumerate(sentences):
+        fresh = [
+            name
+            for name in find_uncovered_members(sentence, wanted)
+            if name not in covered
+        ]
+        if fresh and len(sentence) <= budget:
+            picked.add(index)
+            covered.update(fresh)
+            budget -= len(sentence)
+    for index, sentence in enumerate(sentences):
+        if index not in picked and len(sentence) <= budget:
+            picked.add(index)
+            budget -= len(sentence)
+    if not picked:
+        return prefix
+    return "".join(sentences[index] for index in sorted(picked))
 
 
 MINUTES_REQUEST_ATTEMPTS = 3
@@ -902,7 +971,33 @@ MINUTES_COMPRESSION_FEEDBACK = (
 )
 
 
-def _bounded_minutes(prompt: str, *, request_text: RequestText) -> str:
+class MemberCoverageError(RuntimeError):
+    """A minutes response that skipped one or more expected participants."""
+
+    def __init__(self, missing: tuple[str, ...]) -> None:
+        super().__init__("讨论纪要未覆盖主要参与者：" + "、".join(missing))
+        self.missing = missing
+
+
+def _minutes_rewrite_feedback(error: RuntimeError) -> str:
+    """Pick rewrite guidance matching the validation failure."""
+
+    if isinstance(error, MemberCoverageError):
+        return (
+            f"纪要遗漏了主要参与者：{'、'.join(error.missing)}。"
+            f"请在 {MAX_MINUTES_CHARACTERS} 字内补齐覆盖：基于其实际发言精简概括"
+            "各自的观点或态度，可进一步压缩已有成员的表述；"
+            "不要为满足覆盖而虚构发言、观点或立场。"
+        )
+    return MINUTES_COMPRESSION_FEEDBACK.format(limit=MAX_MINUTES_CHARACTERS)
+
+
+def _bounded_minutes(
+    prompt: str,
+    *,
+    request_text: RequestText,
+    expected: Sequence[str] = (),
+) -> str:
     """Request one minutes paragraph, pressing compression before truncating."""
 
     error: RuntimeError | None = None
@@ -912,11 +1007,15 @@ def _bounded_minutes(prompt: str, *, request_text: RequestText) -> str:
             request_prompt = (
                 prompt
                 + f"\n\n注意：上一次响应未通过校验（{error}）。"
-                + MINUTES_COMPRESSION_FEEDBACK.format(limit=MAX_MINUTES_CHARACTERS)
+                + _minutes_rewrite_feedback(error)
             )
         try:
             response = request_text(request_prompt)
-            return normalize_minutes(response)
+            paragraph = normalize_minutes(response)
+            missing = find_uncovered_members(paragraph, expected)
+            if missing:
+                raise MemberCoverageError(missing)
+            return paragraph
         except RuntimeError as caught:
             error = caught
     # 重写穷尽后的最后兜底：只要响应是够长的散文段落就按上限截断保留，不再
@@ -924,7 +1023,7 @@ def _bounded_minutes(prompt: str, *, request_text: RequestText) -> str:
     # 兜底；拒答文本与 JSON 垃圾不在此列。
     response = request_text(prompt)
     try:
-        return truncate_minutes(_normalize_minutes_text(response))
+        return truncate_minutes(_normalize_minutes_text(response), expected)
     except RuntimeError as caught:
         try:
             paragraph = _sanitize_minutes_paragraph(response)
@@ -935,7 +1034,7 @@ def _bounded_minutes(prompt: str, *, request_text: RequestText) -> str:
         )
         if not salvageable:
             raise caught
-        return truncate_minutes(paragraph)
+        return truncate_minutes(paragraph, expected)
 
 
 def _text_chunks(
@@ -968,19 +1067,29 @@ def summarize_topic(
     messages_by_id: dict[int, DiscussionMessage],
     maximum_characters: int,
     request_text: RequestText,
+    participants: Sequence[str] = (),
 ) -> str:
     """Summarize selected topic messages in chronological, bounded passes."""
 
     messages = tuple(messages_by_id[index] for index in candidate.message_indices)
-    partial_instruction = _minutes_instruction(candidate.title, partial=True)
+    expected_members = [name for name in dict.fromkeys(participants) if name]
+    partial_instruction = _minutes_instruction(
+        candidate.title, partial=True, participants=expected_members
+    )
     partials: list[str] = []
     for chunk in chunk_message_prompts(
         messages,
         instruction=partial_instruction,
         maximum_characters=maximum_characters,
     ):
+        chunk_members = {item.member for item in chunk.messages}
+        chunk_expected = [name for name in expected_members if name in chunk_members]
         try:
-            partials.append(_bounded_minutes(chunk.prompt, request_text=request_text))
+            partials.append(
+                _bounded_minutes(
+                    chunk.prompt, request_text=request_text, expected=chunk_expected
+                )
+            )
         except RuntimeError as error:
             print(
                 f"警告：议题“{candidate.title}”的分段纪要生成失败，"
@@ -993,19 +1102,39 @@ def summarize_topic(
         return partials[0]
     instruction = _minutes_instruction(candidate.title, partial=False)
     current = partials
-    while len(current) > 1:
-        merged: list[str] = []
-        for group in _text_chunks(
+    for _round in range(8):
+        if len(current) == 1:
+            break
+        chunks = _text_chunks(
             tuple(current), instruction=instruction, maximum_characters=maximum_characters
-        ):
+        )
+        if len(chunks) > 1 and all(len(group) == 1 for group in chunks):
+            # 预算装不下任何两条分段，本轮无进展，继续循环会死循环；
+            # 保留分段原文按句子边界拼接截断降级。
+            print(
+                f"警告：议题“{candidate.title}”的分段纪要超出归并预算，"
+                "已拼接分段纪要降级",
+                flush=True,
+            )
+            break
+        merged: list[str] = []
+        for group in chunks:
             if len(group) == 1:
                 merged.extend(group)
                 continue
+            group_text = "\n".join(group)
+            # 归并输入只有分段文本：预期覆盖取名单中在其输入里出现过的成员。
+            group_expected = [
+                name
+                for name in expected_members
+                if name not in find_uncovered_members(group_text, expected_members)
+            ]
             try:
                 merged.append(
                     _bounded_minutes(
-                        instruction + "\n\n分段纪要如下：\n" + "\n".join(group),
+                        instruction + "\n\n分段纪要如下：\n" + group_text,
                         request_text=request_text,
+                        expected=group_expected,
                     )
                 )
             except RuntimeError as error:
@@ -1014,8 +1143,10 @@ def summarize_topic(
                     f"已拼接分段纪要降级：{error}",
                     flush=True,
                 )
-                merged.append(truncate_minutes("".join(group)))
+                merged.append(truncate_minutes("".join(group), group_expected))
         current = merged
+    if len(current) > 1:
+        current = [truncate_minutes("".join(current), expected_members)]
     return current[0]
 
 
@@ -1216,6 +1347,7 @@ def analyze_discussion_minutes(
                 messages_by_id=messages_by_id,
                 maximum_characters=maximum_input_characters,
                 request_text=request_text,
+                participants=participants,
             )
         except RuntimeError as error:
             print(
