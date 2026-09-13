@@ -15,10 +15,15 @@ from src.qqstalker_cli.contextual_analysis import TranscriptMessage
 
 
 RequestText = Callable[[str], str]
+RejectionListener = Callable[[str, str], None]
 CODE_FENCE = chr(96) * 3
 PLACEHOLDER_PATTERN = re.compile(
     r"(?:\*{0,2}\[(?:无文本内容|消息已撤回|"
     r"图片(?:\s*[×x]\s*\d+)?|动画表情|表情(?:包)?|文件[^\]]*)\]\*{0,2})"
+)
+# 部分导出源不产方括号占位，直接写“图片:<文件名>”这类裸媒体标记。
+BARE_MEDIA_PATTERN = re.compile(
+    r"\s*(?:图片|视频|文件|语音)\s*[:：]\s*[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,5}"
 )
 EMOJI_PATTERN = re.compile(r"[\U0001F1E6-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]+")
 SENTENCE_END_PATTERN = re.compile(r"[。！？!?]")
@@ -298,8 +303,11 @@ def discussion_text(message: TranscriptMessage) -> str | None:
     """Remove exporter placeholders and reject messages without real text."""
 
     text = PLACEHOLDER_PATTERN.sub("", message.content)
+    text = BARE_MEDIA_PATTERN.sub("", text)
     text = EMOJI_PATTERN.sub("", text)
-    text = text.strip(" \t\r\n*_~>，。！？!?、:：;；.-—()（）[]【】")
+    # 方括号类字符不能进入 strip 集合：行首“[回复消息]”等完整标记会被剥掉
+    # 开括号，留下“回复消息]”式的残缺文本。
+    text = text.strip(" \t\r\n*_~>，。！？!?、:：;；.-—")
     return text or None
 
 
@@ -688,14 +696,27 @@ def write_refusal_trace(
         print(f"警告：无法写入拒答记录：{os_error}", flush=True)
 
 
+VALIDATED_REQUEST_ATTEMPTS = 3
+
+
 def _validated_request(
-    prompt: str, *, request_text: RequestText, parser: Callable[[str], T]
+    prompt: str,
+    *,
+    request_text: RequestText,
+    parser: Callable[[str], T],
+    on_rejected: RejectionListener | None = None,
 ) -> T:
-    """Retry one malformed response with the validation error as feedback."""
+    """Retry malformed responses with the validation error as feedback.
+
+    所有以 JSON 对象为输出约定的大模型请求阶段（分段识别、议题归并，
+    以及后续新增阶段）MUST 复用本入口发起请求，确保校验重试与缓存清除
+    行为一致；尝试总数由 VALIDATED_REQUEST_ATTEMPTS 统一约束。
+    on_rejected 在校验失败时以（当次请求 prompt，被拒响应文本）调用，
+    供上层清除可能已写入的缓存条目。
+    """
 
     error: RuntimeError | None = None
-    response = ""
-    for attempt in range(2):
+    for attempt in range(VALIDATED_REQUEST_ATTEMPTS):
         request_prompt = prompt
         if attempt and error is not None:
             request_prompt = (
@@ -703,11 +724,14 @@ def _validated_request(
                 + f"\n\n注意：上一次响应未通过校验（{error}）。"
                 "请严格按原始要求修正该问题并重新完整输出。"
             )
+        attempt_response = ""
         try:
-            response = request_text(request_prompt)
-            return parser(response)
+            attempt_response = request_text(request_prompt)
+            return parser(attempt_response)
         except RuntimeError as caught:
-            error = ValidatedResponseError(str(caught), response)
+            error = ValidatedResponseError(str(caught), attempt_response)
+            if on_rejected is not None and attempt_response:
+                on_rejected(request_prompt, attempt_response)
     assert error is not None
     raise error
 
@@ -717,6 +741,7 @@ def merge_topic_candidates(
     *,
     maximum_characters: int,
     request_text: RequestText,
+    on_rejected: RejectionListener | None = None,
 ) -> tuple[TopicCandidate, ...]:
     """Merge candidates in bounded rounds, including cross-segment themes."""
 
@@ -736,6 +761,7 @@ def merge_topic_candidates(
                     parser=lambda response, sources=sources, namespace=namespace: parse_merge_response(
                         response, sources=sources, namespace=namespace
                     ),
+                    on_rejected=on_rejected,
                 )
             )
         current = tuple(sorted(merged, key=lambda item: item.first_index))
@@ -769,8 +795,8 @@ def _strip_asterisks_outside_markers(text: str) -> str:
     )
 
 
-def _normalize_minutes_text(response: str) -> str:
-    """Keep one safe, multi-sentence natural-language paragraph, uncapped."""
+def _sanitize_minutes_paragraph(response: str) -> str:
+    """Strip fences, executable markup, and emphasis into one plain paragraph."""
 
     text = response.strip()
     if text.startswith(CODE_FENCE) and text.endswith(CODE_FENCE):
@@ -783,7 +809,14 @@ def _normalize_minutes_text(response: str) -> str:
         if line.strip()
     ]
     paragraph = "".join(lines).strip()
-    paragraph = _strip_asterisks_outside_markers(paragraph).replace("__", "")
+    return _strip_asterisks_outside_markers(paragraph).replace("__", "")
+
+
+def _normalize_minutes_text(response: str) -> str:
+    """Keep one safe, multi-sentence natural-language paragraph, uncapped."""
+
+    text = response.strip()
+    paragraph = _sanitize_minutes_paragraph(response)
     if not paragraph or len(SENTENCE_END_PATTERN.findall(paragraph)) < 2:
         raise RuntimeError(
             f"讨论纪要必须是包含多个句子的自然段（响应开头：{paragraph[:60] or text[:60]}）"
@@ -806,13 +839,9 @@ MINUTES_EXCERPT_LIMIT = 8
 MINUTES_EXCERPT_CHARACTERS = 60
 
 
-def fallback_minutes_excerpt(
-    messages: Sequence[DiscussionMessage], *, reason: str
-) -> str:
+def fallback_minutes_excerpt(messages: Sequence[DiscussionMessage]) -> str:
     """Compose a deterministic, speaker-balanced excerpt after minutes failure."""
 
-    reason_head = re.split(r"[。；;\n]", reason, maxsplit=1)[0].strip()[:80]
-    header = f"模型纪要生成失败（{reason_head}）"
     by_member: dict[str, list[DiscussionMessage]] = {}
     for message in messages:
         by_member.setdefault(message.member, []).append(message)
@@ -835,27 +864,35 @@ def fallback_minutes_excerpt(
                     picked.append(choice)
                     picked_indices.add(choice.index)
     if not picked:
-        return f"{header}，且该议题没有可摘录的文字消息。"
+        return "本议题没有可摘录的文字发言。"
     picked.sort(key=lambda message: (message.timestamp, message.index))
-    lines = [f"{header}，以下为主要发言摘录："]
+    lines = ["主要发言摘录："]
     for message in picked:
         content = message.content
-        ellipsis = "…" if len(content) > MINUTES_EXCERPT_CHARACTERS else ""
+        if len(content) > MINUTES_EXCERPT_CHARACTERS:
+            content = truncate_at_sentence(content, MINUTES_EXCERPT_CHARACTERS)
+            if not SENTENCE_END_PATTERN.fullmatch(content[-1]):
+                content += "…"
         lines.append(
-            f"- [{message.timestamp:%H:%M}] {message.member}："
-            f"{content[:MINUTES_EXCERPT_CHARACTERS]}{ellipsis}"
+            f"- [{message.timestamp:%H:%M}] {message.member}：{content}"
         )
     return "\n".join(lines)
+
+
+def truncate_at_sentence(text: str, limit: int) -> str:
+    """Cut over-limit text at its last sentence end inside the limit."""
+
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    sentence_ends = [match.end() for match in SENTENCE_END_PATTERN.finditer(cut)]
+    return cut[: sentence_ends[-1]] if sentence_ends else cut
 
 
 def truncate_minutes(paragraph: str) -> str:
     """Deterministically cap a paragraph at the limit on sentence boundaries."""
 
-    if len(paragraph) <= MAX_MINUTES_CHARACTERS:
-        return paragraph
-    cut = paragraph[:MAX_MINUTES_CHARACTERS]
-    sentence_ends = [match.end() for match in SENTENCE_END_PATTERN.finditer(cut)]
-    return cut[: sentence_ends[-1]] if sentence_ends else cut
+    return truncate_at_sentence(paragraph, MAX_MINUTES_CHARACTERS)
 
 
 MINUTES_REQUEST_ATTEMPTS = 3
@@ -882,7 +919,23 @@ def _bounded_minutes(prompt: str, *, request_text: RequestText) -> str:
             return normalize_minutes(response)
         except RuntimeError as caught:
             error = caught
-    return truncate_minutes(_normalize_minutes_text(request_text(prompt)))
+    # 重写穷尽后的最后兜底：只要响应是够长的散文段落就按上限截断保留，不再
+    # 要求多句校验——模型可能输出整段只有句末逗号的长句，直接放弃会掉到摘录
+    # 兜底；拒答文本与 JSON 垃圾不在此列。
+    response = request_text(prompt)
+    try:
+        return truncate_minutes(_normalize_minutes_text(response))
+    except RuntimeError as caught:
+        try:
+            paragraph = _sanitize_minutes_paragraph(response)
+        except RuntimeError:
+            raise caught
+        salvageable = (
+            len(paragraph) >= MINUTES_EXCERPT_CHARACTERS and paragraph[:1] not in "{["
+        )
+        if not salvageable:
+            raise caught
+        return truncate_minutes(paragraph)
 
 
 def _text_chunks(
@@ -920,14 +973,22 @@ def summarize_topic(
 
     messages = tuple(messages_by_id[index] for index in candidate.message_indices)
     partial_instruction = _minutes_instruction(candidate.title, partial=True)
-    partials = tuple(
-        _bounded_minutes(chunk.prompt, request_text=request_text)
-        for chunk in chunk_message_prompts(
-            messages,
-            instruction=partial_instruction,
-            maximum_characters=maximum_characters,
-        )
-    )
+    partials: list[str] = []
+    for chunk in chunk_message_prompts(
+        messages,
+        instruction=partial_instruction,
+        maximum_characters=maximum_characters,
+    ):
+        try:
+            partials.append(_bounded_minutes(chunk.prompt, request_text=request_text))
+        except RuntimeError as error:
+            print(
+                f"警告：议题“{candidate.title}”的分段纪要生成失败，"
+                f"已跳过该分段：{error}",
+                flush=True,
+            )
+    if not partials:
+        raise RuntimeError("讨论纪要的全部分段均生成失败")
     if len(partials) == 1:
         return partials[0]
     instruction = _minutes_instruction(candidate.title, partial=False)
@@ -935,21 +996,27 @@ def summarize_topic(
     while len(current) > 1:
         merged: list[str] = []
         for group in _text_chunks(
-            current, instruction=instruction, maximum_characters=maximum_characters
+            tuple(current), instruction=instruction, maximum_characters=maximum_characters
         ):
             if len(group) == 1:
                 merged.extend(group)
                 continue
-            merged.append(
-                _bounded_minutes(
-                    instruction + "\n\n分段纪要如下：\n" + "\n".join(group),
-                    request_text=request_text,
+            try:
+                merged.append(
+                    _bounded_minutes(
+                        instruction + "\n\n分段纪要如下：\n" + "\n".join(group),
+                        request_text=request_text,
+                    )
                 )
-            )
-        current = tuple(merged)
-        if not current:
-            raise RuntimeError("讨论纪要归并未产生有效内容")
-    return next(iter(current))
+            except RuntimeError as error:
+                print(
+                    f"警告：议题“{candidate.title}”的纪要归并失败，"
+                    f"已拼接分段纪要降级：{error}",
+                    flush=True,
+                )
+                merged.append(truncate_minutes("".join(group)))
+        current = merged
+    return current[0]
 
 
 def _granularity(start: datetime, end: datetime) -> str:
@@ -1049,6 +1116,7 @@ def analyze_discussion_minutes(
     maximum_input_characters: int,
     request_text: RequestText,
     maximum_workers: int = 1,
+    on_rejected: RejectionListener | None = None,
 ) -> DiscussionReport:
     """Identify, rank, summarize, and chart all major discussion topics."""
 
@@ -1073,6 +1141,7 @@ def analyze_discussion_minutes(
                         expected_messages=chunk.messages,
                         namespace=namespace,
                     ),
+                    on_rejected=on_rejected,
                 ),
                 None,
             )
@@ -1117,6 +1186,7 @@ def analyze_discussion_minutes(
         tuple(local),
         maximum_characters=maximum_input_characters,
         request_text=request_text,
+        on_rejected=on_rejected,
     )
     merged = tuple(merged) + tuple(skipped)
     selected = tuple(
@@ -1152,7 +1222,7 @@ def analyze_discussion_minutes(
                 f"警告：议题“{candidate.title}”的纪要生成失败，已保留议题条目：{error}",
                 flush=True,
             )
-            minutes = fallback_minutes_excerpt(topic_messages, reason=str(error))
+            minutes = fallback_minutes_excerpt(topic_messages)
         return DiscussionTopic(
             candidate.candidate_id,
             candidate.title,

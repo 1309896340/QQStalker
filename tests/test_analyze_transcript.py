@@ -1709,14 +1709,43 @@ class DiscussionMinutesTests(unittest.TestCase):
                 index, timestamp, "甲", content, content
             )
             for index, content in enumerate(
-                ("[图片]", "*[消息已撤回]*", "😀", "文字 [图片]", "有效讨论"),
+                (
+                    "[图片]",
+                    "*[消息已撤回]*",
+                    "😀",
+                    "文字 [图片]",
+                    "有效讨论",
+                    "图片:E0D8863E6O7DF491270293529BEE3F7E.jpg",
+                    "视频:0f233228b7f3eda9fef8d8bdbe5115b1d.mp4",
+                    "[回复消息]@乙 那时候香港本来想选郑伊健",
+                )
             )
         )
 
         effective = discussion_analysis.filter_discussion_messages(messages)
 
-        self.assertEqual([item.index for item in effective], [3, 4])
-        self.assertEqual([item.content for item in effective], ["文字", "有效讨论"])
+        self.assertEqual([item.index for item in effective], [3, 4, 7])
+        self.assertEqual(
+            [item.content for item in effective],
+            ["文字", "有效讨论", "[回复消息]@乙 那时候香港本来想选郑伊健"],
+        )
+
+    def test_bare_media_with_text_keeps_text_part(self) -> None:
+        """Mixed messages lose the bare media marker but stay in the set."""
+
+        message = contextual_analysis.TranscriptMessage(
+            0,
+            datetime(2026, 9, 11, 9, 0),
+            "甲",
+            "看看这张 图片:E0D8863E.jpg 就明白了",
+            "",
+        )
+
+        effective = discussion_analysis.filter_discussion_messages((message,))
+
+        self.assertEqual(
+            [item.content for item in effective], ["看看这张 就明白了"]
+        )
 
     def test_segment_line_ranges_normalize_to_full_coverage(self) -> None:
         messages = (
@@ -2135,6 +2164,22 @@ class DiscussionMinutesTests(unittest.TestCase):
         self.assertFalse(responses)
         self.assertLessEqual(len(result), discussion_analysis.MAX_MINUTES_CHARACTERS)
 
+    def test_truncate_at_sentence_cuts_on_boundaries(self) -> None:
+        """Over-limit text is cut at the last sentence end inside the limit."""
+
+        within = "短句。"
+        self.assertEqual(discussion_analysis.truncate_at_sentence(within, 10), within)
+
+        periodic = "第一句内容。" * 10
+        cut = discussion_analysis.truncate_at_sentence(periodic, 20)
+        self.assertEqual(cut, "第一句内容。" * 3)
+        self.assertLessEqual(len(cut), 20)
+
+        no_punctuation = "甲" * 30
+        self.assertEqual(
+            discussion_analysis.truncate_at_sentence(no_punctuation, 10), "甲" * 10
+        )
+
     def test_bounded_minutes_rewrites_with_compression_feedback(self) -> None:
         long_text = "甲提出观点并说明理由。" * 30
         good_text = "甲提出核心观点。乙补充事实并总结结论。"
@@ -2166,6 +2211,28 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
         self.assertEqual(len(prompts), discussion_analysis.MINUTES_REQUEST_ATTEMPTS + 1)
         self.assertLessEqual(len(result), discussion_analysis.MAX_MINUTES_CHARACTERS)
+
+    def test_bounded_minutes_salvages_run_on_response_after_rewrites_fail(self) -> None:
+        """A long comma-only paragraph is truncated instead of dropping to excerpts."""
+
+        run_on = "模型用逗号连接的漫长发言，" * 60
+        result = discussion_analysis._bounded_minutes(
+            "任意提示", request_text=lambda _prompt: run_on
+        )
+        self.assertLessEqual(len(result), discussion_analysis.MAX_MINUTES_CHARACTERS)
+        self.assertGreater(len(result), 0)
+
+        refusal = "抱歉，我无法回答这个问题。"
+        with self.assertRaisesRegex(RuntimeError, "讨论纪要必须是包含多个句子的自然段"):
+            discussion_analysis._bounded_minutes(
+                "任意提示", request_text=lambda _prompt: refusal
+            )
+
+        unsafe = "<script>alert(1)</script>" + "长内容，" * 100
+        with self.assertRaisesRegex(RuntimeError, "可执行标记"):
+            discussion_analysis._bounded_minutes(
+                "任意提示", request_text=lambda _prompt: unsafe
+            )
 
     def test_member_highlights_bold_names_and_assign_distinct_colors(self) -> None:
         moment = datetime(2026, 9, 11, 9, 0)
@@ -2391,6 +2458,151 @@ class DiscussionMinutesTests(unittest.TestCase):
             sum(topic.message_count for topic in report.topics), 6 - refused_total
         )
 
+    def test_failed_segment_never_leaks_error_text_into_merge_requests(self) -> None:
+        """A fully failed segment must degrade without polluting merge inputs."""
+
+        timestamp = datetime(2026, 9, 11, 9, 0)
+        source = tuple(
+            contextual_analysis.TranscriptMessage(
+                index, timestamp.replace(hour=9 + index), "甲", f"消息{index}内容", ""
+            )
+            for index in range(6)
+        )
+        invalid_response = "抱歉，我无法按要求数据格式回答。"
+        merge_prompts: list[str] = []
+
+        def scripted_request(prompt: str) -> str:
+            if "候选议题如下" in prompt:
+                merge_prompts.append(prompt)
+                payload = prompt.split("候选议题如下：\n", 1)[1]
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "id": "g1",
+                                "title": "统一议题",
+                                "summary": "统一后的摘要",
+                                "source_ids": re.findall(r'"id":"([^"]+)"', payload),
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            if "start_line" in prompt:
+                if "消息3" in prompt:
+                    return invalid_response
+                positions = [
+                    int(value) for value in re.findall(r"(?m)^\[(\d+) \|", prompt)
+                ]
+                middle = (positions[0] + positions[-1]) // 2
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "id": "t1",
+                                "title": "话题甲",
+                                "summary": "摘要",
+                                "substantive": True,
+                                "start_line": positions[0],
+                                "end_line": middle,
+                            },
+                            {
+                                "id": "t2",
+                                "title": "话题乙",
+                                "summary": "摘要",
+                                "substantive": True,
+                                "start_line": middle + 1,
+                                "end_line": positions[-1],
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            if "自然段" in prompt:
+                return "甲提出观点并作出总结。乙补充事实并反思讨论结果。"
+            raise AssertionError(f"未预期的请求：{prompt[:60]}")
+
+        with patch.object(
+            discussion_analysis, "write_refusal_trace"
+        ) as refusal_trace:
+            report = discussion_analysis.analyze_discussion_minutes(
+                source,
+                maximum_topics=5,
+                maximum_input_characters=500,
+                request_text=scripted_request,
+            )
+
+        refusal_trace.assert_called_once()
+        self.assertEqual(refusal_trace.call_args.kwargs["response"], invalid_response)
+        self.assertEqual([topic.title for topic in report.topics], ["统一议题"])
+        self.assertGreater(len(merge_prompts), 0)
+        for prompt in merge_prompts:
+            self.assertNotIn(invalid_response, prompt)
+            self.assertNotIn("重新完整输出", prompt)
+            self.assertNotIn("未通过校验", prompt)
+            self.assertNotIn("未识别片段", prompt)
+
+    def test_malformed_json_retry_recovers_without_refusal_trace(self) -> None:
+        """A missing quote in JSON must retry with feedback and succeed cleanly."""
+
+        timestamp = datetime(2026, 9, 11, 9, 0)
+        source = tuple(
+            contextual_analysis.TranscriptMessage(
+                index, timestamp.replace(hour=9 + index), "甲", f"消息{index}内容", ""
+            )
+            for index in range(3)
+        )
+        malformed_response = (
+            '{"topics": [\n'
+            '    {"id": "t1", "title":缺少引号的标题", "summary": "摘要",'
+            ' "substantive": true, "start_line": 1, "end_line": 3}\n'
+            "]}"
+        )
+        segment_prompts: list[str] = []
+
+        def scripted_request(prompt: str) -> str:
+            if "start_line" in prompt:
+                segment_prompts.append(prompt)
+                if len(segment_prompts) == 1:
+                    return malformed_response
+                positions = [
+                    int(value) for value in re.findall(r"(?m)^\[(\d+) \|", prompt)
+                ]
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "id": "t1",
+                                "title": "话题甲",
+                                "summary": "摘要",
+                                "substantive": True,
+                                "start_line": positions[0],
+                                "end_line": positions[-1],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            if "自然段" in prompt:
+                return "甲提出观点并作出总结。乙补充事实并反思讨论结果。"
+            raise AssertionError(f"未预期的请求：{prompt[:60]}")
+
+        with patch.object(
+            discussion_analysis, "write_refusal_trace"
+        ) as refusal_trace:
+            report = discussion_analysis.analyze_discussion_minutes(
+                source,
+                maximum_topics=5,
+                maximum_input_characters=2_000,
+                request_text=scripted_request,
+            )
+
+        self.assertEqual([topic.title for topic in report.topics], ["话题甲"])
+        self.assertEqual(report.topics[0].message_count, 3)
+        self.assertEqual(len(segment_prompts), 2)
+        self.assertIn("重新完整输出", segment_prompts[1])
+        refusal_trace.assert_not_called()
+
     def test_topic_minutes_failure_keeps_topic_entry(self) -> None:
         """A refused minutes request degrades one topic instead of the whole section."""
 
@@ -2447,8 +2659,117 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
         self.assertEqual(len(report.topics), 1)
         self.assertEqual(report.topics[0].message_count, 2)
-        self.assertIn("模型纪要生成失败", report.topics[0].minutes)
-        self.assertIn("[10:00] **甲**：消息1内容", report.topics[0].minutes)
+        minutes = report.topics[0].minutes
+        self.assertIn("主要发言摘录：", minutes)
+        self.assertIn("[09:00] **甲**：消息0内容", minutes)
+        self.assertIn("[10:00] **甲**：消息1内容", minutes)
+        self.assertNotIn("模型纪要生成失败", minutes)
+        self.assertNotIn("响应开头", minutes)
+        self.assertNotIn("抱歉", minutes)
+
+    @staticmethod
+    def _two_segment_topic_source() -> tuple:
+        timestamp = datetime(2026, 9, 11, 9, 0)
+        return tuple(
+            contextual_analysis.TranscriptMessage(
+                index,
+                timestamp.replace(hour=9 + index),
+                "成员",
+                f"{'甲段' if index == 0 else '乙段'}{'讨论内容' * 30}",
+                "",
+            )
+            for index in range(2)
+        )
+
+    @staticmethod
+    def _topic_scripted_request(minutes_by_marker: dict[str, str], refusal: str):
+        def scripted_request(prompt: str) -> str:
+            if "分段纪要如下" in prompt:
+                return refusal
+            if "讨论纪要" in prompt:
+                for marker, paragraph in minutes_by_marker.items():
+                    if marker in prompt:
+                        return paragraph
+                return refusal
+            if "候选议题如下" in prompt:
+                payload = prompt.split("候选议题如下：\n", 1)[1]
+                return json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "id": "g1",
+                                "title": "有效讨论",
+                                "summary": "摘要",
+                                "source_ids": re.findall(r'"id":"([^"]+)"', payload),
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            positions = [int(value) for value in re.findall(r"(?m)^\[(\d+) \|", prompt)]
+            return json.dumps(
+                {
+                    "topics": [
+                        {
+                            "id": "t1",
+                            "title": "有效讨论",
+                            "summary": "摘要",
+                            "substantive": True,
+                            "start_line": positions[0],
+                            "end_line": positions[-1],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+
+        return scripted_request
+
+    def test_single_segment_failure_is_skipped_not_fatal(self) -> None:
+        """One refused segment minutes is dropped; the others still merge."""
+
+        source = self._two_segment_topic_source()
+        paragraph = "乙段讨论了游戏机制的核心分歧。参与者最终达成一致。"
+        scripted = self._topic_scripted_request({"乙段": paragraph}, "抱歉，我无法回答。")
+
+        output = StringIO()
+        with redirect_stdout(output):
+            report = discussion_analysis.analyze_discussion_minutes(
+                source,
+                maximum_topics=5,
+                maximum_input_characters=500,
+                request_text=scripted,
+            )
+
+        self.assertIn("已跳过该分段", output.getvalue())
+        self.assertEqual(len(report.topics), 1)
+        self.assertEqual(report.topics[0].minutes, paragraph)
+
+    def test_merge_failure_splices_validated_partial_minutes(self) -> None:
+        """A failed merge request falls back to joining validated partials."""
+
+        source = self._two_segment_topic_source()
+        first = "甲段讨论了地图编辑器的历史渊源。参与者补充了社区模组生态。"
+        second = "乙段讨论了游戏机制的核心分歧。参与者最终达成一致。"
+        scripted = self._topic_scripted_request(
+            {"甲段": first, "乙段": second}, "抱歉，我无法回答。"
+        )
+
+        output = StringIO()
+        with redirect_stdout(output):
+            report = discussion_analysis.analyze_discussion_minutes(
+                source,
+                maximum_topics=5,
+                maximum_input_characters=500,
+                request_text=scripted,
+            )
+
+        self.assertIn("已拼接分段纪要降级", output.getvalue())
+        self.assertEqual(len(report.topics), 1)
+        minutes = report.topics[0].minutes
+        self.assertEqual(minutes, first + second)
+        self.assertLessEqual(len(minutes), discussion_analysis.MAX_MINUTES_CHARACTERS)
+        self.assertNotIn("抱歉", minutes)
 
     def test_fallback_minutes_excerpt_balances_members_and_truncates(self) -> None:
         moment = datetime(2026, 9, 11, 14, 22)
@@ -2465,27 +2786,36 @@ class DiscussionMinutesTests(unittest.TestCase):
             discussion_analysis.DiscussionMessage(
                 4, datetime(2026, 9, 11, 14, 26), "丙", "丙的唯一发言"
             ),
+            discussion_analysis.DiscussionMessage(
+                5,
+                datetime(2026, 9, 11, 14, 28),
+                "丁",
+                "丁的第一句话。" + "丁继续补充没有标点的长内容" * 10,
+            ),
         ]
 
-        excerpt = discussion_analysis.fallback_minutes_excerpt(
-            messages, reason="响应被服务端内容审查拦截（finish_reason=content_filter）"
-        )
+        excerpt = discussion_analysis.fallback_minutes_excerpt(messages)
 
-        self.assertIn("模型纪要生成失败（响应被服务端内容审查拦截", excerpt)
+        self.assertIn("主要发言摘录：", excerpt)
+        self.assertNotIn("模型纪要生成失败", excerpt)
+        self.assertNotIn("响应开头", excerpt)
         self.assertIn("- [14:20] 甲：甲的短消息", excerpt)
         self.assertIn("甲的重要补充内容", excerpt)
-        self.assertIn("- [14:22] 乙：", excerpt)
+        # 界内无句末标点的截断以省略号收尾
         self.assertTrue(
-            any(line.startswith("- [14:22] 乙：") and line.endswith("…") for line in excerpt.splitlines())
+            any(
+                line.startswith("- [14:22] 乙：") and line.endswith("…")
+                for line in excerpt.splitlines()
+            )
         )
         self.assertIn("- [14:26] 丙：丙的唯一发言", excerpt)
-        # 三名参与者各至少一条，时间升序
-        self.assertLess(excerpt.index("[14:20]"), excerpt.index("[14:26]"))
+        # 界内有句末标点时截断在标点处，不再出现半截话
+        self.assertIn("- [14:28] 丁：丁的第一句话。", excerpt)
+        # 四名参与者各至少一条，时间升序
+        self.assertLess(excerpt.index("[14:20]"), excerpt.index("[14:28]"))
 
-        empty = discussion_analysis.fallback_minutes_excerpt(
-            [], reason="流式响应未产生增量文本"
-        )
-        self.assertIn("没有可摘录的文字消息", empty)
+        empty = discussion_analysis.fallback_minutes_excerpt([])
+        self.assertIn("没有可摘录的文字发言", empty)
 
     def test_fallback_llm_setting_requires_complete_configuration(self) -> None:
         """The fallback model is either fully configured or disabled entirely."""
@@ -2682,7 +3012,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
 
     def test_retry_sends_corrective_feedback(self) -> None:
-        """The single retry must tell the model exactly which check failed."""
+        """Each retry must tell the model exactly which check failed."""
 
         prompts: list[str] = []
         responses = iter(("bad", "good"))
@@ -2705,10 +3035,79 @@ class DiscussionMinutesTests(unittest.TestCase):
         )
 
         self.assertEqual(result, "good")
-        self.assertEqual(len(prompts), 4)
+        self.assertEqual(
+            len(prompts), discussion_analysis.VALIDATED_REQUEST_ATTEMPTS + 2
+        )
         self.assertTrue(prompts[1].startswith("原始提示"))
         self.assertIn("start_line 必须是整数", prompts[1])
         self.assertIn("重新完整输出", prompts[1])
+
+    def test_retry_stops_after_bounded_attempts(self) -> None:
+        """Repeatedly invalid responses must stop at the unified attempt bound."""
+
+        prompts: list[str] = []
+
+        def parser(response: str) -> str:
+            raise RuntimeError("响应不是 JSON 对象")
+
+        with self.assertRaisesRegex(RuntimeError, "响应不是 JSON 对象"):
+            discussion_analysis._validated_request(
+                "原始提示",
+                request_text=lambda prompt: (prompts.append(prompt), "坏响应")[1],
+                parser=parser,
+            )
+
+        self.assertEqual(len(prompts), discussion_analysis.VALIDATED_REQUEST_ATTEMPTS)
+        self.assertIn("重新完整输出", prompts[-1])
+
+    def test_rejection_listener_receives_prompt_of_failed_attempt(self) -> None:
+        """The listener must see the exact prompt whose response was rejected."""
+
+        seen: list[tuple[str, str]] = []
+        responses = iter(("坏响应一", "坏响应二", "好响应"))
+        feedback_mark = "重新完整输出"
+
+        def parser(response: str) -> str:
+            if response != "好响应":
+                raise RuntimeError("结构非法")
+            return response
+
+        result = discussion_analysis._validated_request(
+            "原始提示",
+            request_text=lambda prompt: next(responses),
+            parser=parser,
+            on_rejected=lambda prompt, response: seen.append((prompt, response)),
+        )
+
+        self.assertEqual(result, "好响应")
+        self.assertEqual(
+            [response for _, response in seen], ["坏响应一", "坏响应二"]
+        )
+        first_prompt, _ = seen[0]
+        second_prompt, _ = seen[1]
+        self.assertEqual(first_prompt, "原始提示")
+        self.assertNotIn(feedback_mark, first_prompt)
+        self.assertTrue(second_prompt.startswith("原始提示"))
+        self.assertIn(feedback_mark, second_prompt)
+        self.assertIn("结构非法", second_prompt)
+
+    def test_rejection_listener_skips_transport_failures(self) -> None:
+        """A request that produced no response text must not trigger eviction."""
+
+        seen: list[tuple[str, str]] = []
+
+        def failing_request(_prompt: str) -> str:
+            raise RuntimeError("网络失败")
+
+        with self.assertRaisesRegex(RuntimeError, "网络失败"):
+            discussion_analysis._validated_request(
+                "原始提示",
+                request_text=failing_request,
+                parser=lambda response: response,
+                on_rejected=lambda prompt, response: seen.append((prompt, response)),
+            )
+
+        self.assertEqual(seen, [])
 
     def test_rejection_error_carries_response_head(self) -> None:
         """Refusal texts must surface in errors so the trigger can be reviewed."""
