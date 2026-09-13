@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import BigInteger, Column, JSON, LargeBinary, UniqueConstraint
+from sqlalchemy import BigInteger, Column, DateTime, JSON, LargeBinary, UniqueConstraint
 from sqlmodel import Field, Relationship, SQLModel
 
 
@@ -27,8 +27,13 @@ class ImportBatch(SQLModel, table=True):
     source_size_bytes: int
     exporter_name: str
     exporter_version: str
-    started_at: datetime = Field(default_factory=utc_now, nullable=False)
-    completed_at: datetime | None = None
+    started_at: datetime = Field(
+        default_factory=utc_now,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    completed_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True))
+    )
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
 
     chat: Optional["Chat"] = Relationship(back_populates="import_batches")
@@ -47,8 +52,14 @@ class Chat(SQLModel, table=True):
     self_uid: str
     self_uin: str | None = None
     self_name: str | None = None
-    created_at: datetime = Field(default_factory=utc_now, nullable=False)
-    updated_at: datetime = Field(default_factory=utc_now, nullable=False)
+    created_at: datetime = Field(
+        default_factory=utc_now,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=utc_now,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
 
     import_batches: list[ImportBatch] = Relationship(back_populates="chat")
     memberships: list["ChatMembership"] = Relationship(back_populates="chat")
@@ -65,8 +76,14 @@ class Participant(SQLModel, table=True):
     uin: str | None = Field(default=None, index=True)
     display_name: str
     nickname: str | None = None
-    created_at: datetime = Field(default_factory=utc_now, nullable=False)
-    updated_at: datetime = Field(default_factory=utc_now, nullable=False)
+    created_at: datetime = Field(
+        default_factory=utc_now,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=utc_now,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
 
     memberships: list["ChatMembership"] = Relationship(back_populates="participant")
     sent_messages: list["Message"] = Relationship(back_populates="sender")
@@ -84,7 +101,10 @@ class BinaryResource(SQLModel, table=True):
     mime_type: str | None = None
     byte_size: int
     content: bytes = Field(sa_column=Column(LargeBinary, nullable=False))
-    created_at: datetime = Field(default_factory=utc_now, nullable=False)
+    created_at: datetime = Field(
+        default_factory=utc_now,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
 
     references: list["MessageResource"] = Relationship(back_populates="binary_resource")
 
@@ -99,8 +119,8 @@ class ChatMembership(SQLModel, table=True):
     chat_id: UUID = Field(foreign_key="chats.id", index=True)
     participant_id: UUID = Field(foreign_key="participants.id", index=True)
     group_card: str | None = None
-    first_seen_at: datetime | None = None
-    last_seen_at: datetime | None = None
+    first_seen_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True)))
+    last_seen_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True)))
 
     chat: Chat = Relationship(back_populates="memberships")
     participant: Participant = Relationship(back_populates="memberships")
@@ -124,7 +144,7 @@ class Message(SQLModel, table=True):
     external_id: str
     sequence: str | None = None
     message_type: str = Field(index=True)
-    sent_at: datetime = Field(index=True)
+    sent_at: datetime = Field(sa_column=Column(DateTime(timezone=True), nullable=False, index=True))
     source_timestamp_ms: int = Field(
         sa_column=Column(BigInteger, nullable=False, index=True)
     )
@@ -133,7 +153,10 @@ class Message(SQLModel, table=True):
     recalled: bool = False
     system: bool = False
     raw_content_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    created_at: datetime = Field(default_factory=utc_now, nullable=False)
+    created_at: datetime = Field(
+        default_factory=utc_now,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
 
     chat: Chat = Relationship(back_populates="messages")
     sender: Optional[Participant] = Relationship(back_populates="sent_messages")
