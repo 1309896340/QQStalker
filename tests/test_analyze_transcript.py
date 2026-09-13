@@ -109,6 +109,107 @@ class SelectMembersTests(unittest.TestCase):
         self.assertEqual([member for member, _ in selected], ["乙", "丙", "甲"])
 
 
+class FeaturedQuotesNormalizationTests(unittest.TestCase):
+    def test_parses_plain_text_fields_per_member(self) -> None:
+        """The requested plain 成员/语录/点评 lines must parse into records."""
+
+        records = analyze_transcript.parse_featured_quotes(
+            "成员：甲\n语录：这也太逆天了\n点评：荒诞反差强烈。\n\n"
+            "成员：乙\n语录：第二句\n点评：点评二。"
+        )
+
+        self.assertEqual(
+            records,
+            [
+                ("甲", [("这也太逆天了", "荒诞反差强烈。")]),
+                ("乙", [("第二句", "点评二。")]),
+            ],
+        )
+
+    def test_groups_flat_list_items_by_member(self) -> None:
+        """Legacy flat bullet output must regroup all quotes per member."""
+
+        records = analyze_transcript.parse_featured_quotes(
+            "- **甲**\n  > 第一条语录\n\n- **点评**：点评一。\n\n"
+            "- **乙**\n  > 第二条语录\n\n- **点评**：点评二。\n\n"
+            "- **甲**\n  > 第三条语录\n\n- **点评**：点评三。"
+        )
+
+        self.assertEqual(
+            records,
+            [
+                (
+                    "甲",
+                    [("第一条语录", "点评一。"), ("第三条语录", "点评三。")],
+                ),
+                ("乙", [("第二条语录", "点评二。")]),
+            ],
+        )
+
+    def test_groups_bold_names_inside_blockquotes(self) -> None:
+        """Blockquote-first output must still split quotes per member."""
+
+        records = analyze_transcript.parse_featured_quotes(
+            "### 精选语录\n\n> **甲**\n> 第一条语录\n\n- **点评**：点评一。\n\n"
+            "> **乙**\n> 第二条语录\n\n- **点评**：点评二。"
+        )
+
+        self.assertEqual(
+            records,
+            [
+                ("甲", [("第一条语录", "点评一。")]),
+                ("乙", [("第二条语录", "点评二。")]),
+            ],
+        )
+
+    def test_drops_member_without_parsable_quote(self) -> None:
+        """A member heading with no quote text must not produce an empty card."""
+
+        records = analyze_transcript.parse_featured_quotes(
+            "### 甲\n\n### 乙\n> 唯一语录\n\n- **点评**：点评。"
+        )
+
+        self.assertEqual(records, [("乙", [("唯一语录", "点评。")])])
+
+    def test_returns_no_records_when_nothing_parses(self) -> None:
+        """Unrecognized output must parse to nothing so the raw text is kept."""
+
+        self.assertEqual(
+            analyze_transcript.parse_featured_quotes("模型自由发挥的普通段落。"), []
+        )
+
+    def test_document_renders_quote_structure_itself(self) -> None:
+        """The document must hardcode per-member headings from parsed records."""
+
+        analysis = analyze_transcript.build_analysis_document(
+            member_count=2,
+            portraits=("### 甲\n- 简洁概括",),
+            featured_quotes=(
+                "- **甲**\n  > 语录一\n\n- **点评**：点评一。\n\n"
+                "- **乙**\n  > 语录二\n\n- **点评**：点评二。"
+            ),
+        )
+
+        quotes_section = analysis[analysis.index("## 语录精选") :]
+        self.assertEqual(
+            quotes_section,
+            "## 语录精选\n\n### 甲\n\n> 语录一\n\n- **点评**：点评一。\n\n"
+            "### 乙\n\n> 语录二\n\n- **点评**：点评二。",
+        )
+
+    def test_document_keeps_raw_quotes_when_parsing_fails(self) -> None:
+        """Unparsable quote output must fall back to the raw model text."""
+
+        raw = "模型自由发挥的普通段落。"
+        analysis = analyze_transcript.build_analysis_document(
+            member_count=1,
+            portraits=("### 甲\n- 简洁概括",),
+            featured_quotes=raw,
+        )
+
+        self.assertIn(f"## 语录精选\n\n{raw}", analysis)
+
+
 class AnalysisDocumentTests(unittest.TestCase):
     def test_joins_member_portraits_without_batch_headings(self) -> None:
         """Rendered analysis must contain portraits directly, regardless of request batches."""
@@ -184,7 +285,10 @@ class PromptTests(unittest.TestCase):
 
         self.assertIn("幽默、讽刺或“逆天”程度", prompt)
         self.assertIn("精选 8 条", prompt)
-        self.assertIn("成员名称", prompt)
+        self.assertIn("成员：成员名称", prompt)
+        self.assertIn("语录：语录原文", prompt)
+        self.assertIn("点评：点评内容", prompt)
+        self.assertIn("不要使用任何 Markdown 标记", prompt)
         self.assertIn("QQ 表情", prompt)
         self.assertIn("从展示语录中去除", prompt)
         self.assertIn("去除后没有文字内容的发言不得入选", prompt)
@@ -1680,11 +1784,43 @@ class DiscussionMinutesTests(unittest.TestCase):
             discussion_analysis.MAX_MINUTES_CHARACTERS,
         )
 
-        responses = [long_text, long_text, long_text]
+        responses = [long_text, long_text, long_text, long_text]
         result = discussion_analysis._bounded_minutes(
             "任意提示", request_text=lambda _prompt: responses.pop(0)
         )
         self.assertFalse(responses)
+        self.assertLessEqual(len(result), discussion_analysis.MAX_MINUTES_CHARACTERS)
+
+    def test_bounded_minutes_rewrites_with_compression_feedback(self) -> None:
+        long_text = "甲提出观点并说明理由。" * 30
+        good_text = "甲提出核心观点。乙补充事实并总结结论。"
+        prompts: list[str] = []
+
+        def scripted_request(prompt: str) -> str:
+            prompts.append(prompt)
+            return [long_text, good_text][len(prompts) - 1]
+
+        result = discussion_analysis._bounded_minutes(
+            "任意提示", request_text=scripted_request
+        )
+        self.assertEqual(result, good_text)
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("超过 300 字上限", prompts[1])
+        self.assertIn("合并同类发言", prompts[1])
+        self.assertIn("保留全部主要成员的核心观点与讨论结果", prompts[1])
+
+    def test_bounded_minutes_truncates_only_after_all_rewrites_fail(self) -> None:
+        long_text = "甲提出观点并说明理由。" * 30
+        prompts: list[str] = []
+
+        def scripted_request(prompt: str) -> str:
+            prompts.append(prompt)
+            return long_text
+
+        result = discussion_analysis._bounded_minutes(
+            "任意提示", request_text=scripted_request
+        )
+        self.assertEqual(len(prompts), discussion_analysis.MINUTES_REQUEST_ATTEMPTS + 1)
         self.assertLessEqual(len(result), discussion_analysis.MAX_MINUTES_CHARACTERS)
 
     def test_member_highlights_bold_names_and_assign_distinct_colors(self) -> None:

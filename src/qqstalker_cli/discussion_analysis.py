@@ -812,15 +812,31 @@ def truncate_minutes(paragraph: str) -> str:
     return cut[: sentence_ends[-1]] if sentence_ends else cut
 
 
-def _bounded_minutes(prompt: str, *, request_text: RequestText) -> str:
-    """Request one minutes paragraph with one retry and a truncation fallback."""
+MINUTES_REQUEST_ATTEMPTS = 3
+MINUTES_COMPRESSION_FEEDBACK = (
+    "请合并同类发言、删除次要细节，在 {limit} 字以内重新完整概括；"
+    "保留全部主要成员的核心观点与讨论结果，不要只保留开头或输出截断版本。"
+)
 
-    try:
-        return _validated_request(
-            prompt, request_text=request_text, parser=normalize_minutes
-        )
-    except RuntimeError:
-        return truncate_minutes(_normalize_minutes_text(request_text(prompt)))
+
+def _bounded_minutes(prompt: str, *, request_text: RequestText) -> str:
+    """Request one minutes paragraph, pressing compression before truncating."""
+
+    error: RuntimeError | None = None
+    for attempt in range(MINUTES_REQUEST_ATTEMPTS):
+        request_prompt = prompt
+        if attempt and error is not None:
+            request_prompt = (
+                prompt
+                + f"\n\n注意：上一次响应未通过校验（{error}）。"
+                + MINUTES_COMPRESSION_FEEDBACK.format(limit=MAX_MINUTES_CHARACTERS)
+            )
+        try:
+            response = request_text(request_prompt)
+            return normalize_minutes(response)
+        except RuntimeError as caught:
+            error = caught
+    return truncate_minutes(_normalize_minutes_text(request_text(prompt)))
 
 
 def _text_chunks(
