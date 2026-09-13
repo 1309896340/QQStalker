@@ -412,11 +412,16 @@ class FeaturedQuotesNormalizationTests(unittest.TestCase):
             for index in range(100)
         ]
         transcript = "# 群聊记录\n\n" + "".join(blocks)
-        captured: list[str] = []
+        captured_prompts: list[str] = []
+        captured_kwargs: list[dict[str, object]] = []
 
-        def fake_request(prompt: str, **_kwargs: object) -> tuple[str, str | None]:
-            captured.append(prompt)
-            return "成员：甲\n语录：消息0\n点评：测试。", None
+        def fake_request(prompt: str, **kwargs: object) -> tuple[str, str | None]:
+            captured_prompts.append(prompt)
+            captured_kwargs.append(kwargs)
+            return (
+                '{"quotes": [{"member": "甲", "quote": "消息0", "comment": "测试。"}]}',
+                None,
+            )
 
         with patch.object(
             analyze_transcript, "request_portraits", side_effect=fake_request
@@ -432,17 +437,19 @@ class FeaturedQuotesNormalizationTests(unittest.TestCase):
                 max_input_characters=2_000,
             )
 
-        self.assertEqual(len(captured), 1)
-        self.assertLessEqual(len(captured[0]), 2_000)
-        self.assertIn("消息0", captured[0])
-        self.assertTrue(any(f"消息{index}" in captured[0] for index in range(90, 100)))
+        self.assertEqual(len(captured_prompts), 1)
+        self.assertLessEqual(len(captured_prompts[0]), 2_000)
+        self.assertIn("消息0", captured_prompts[0])
+        self.assertTrue(any(f"消息{index}" in captured_prompts[0] for index in range(90, 100)))
+        self.assertIs(captured_kwargs[0].get("json_output"), True)
 
-    def test_parses_plain_text_fields_per_member(self) -> None:
-        """The requested plain 成员/语录/点评 lines must parse into records."""
+    def test_parses_json_quotes_into_records(self) -> None:
+        """A contract-conforming JSON response must parse into per-member records."""
 
-        records = analyze_transcript.parse_featured_quotes(
-            "成员：甲\n语录：这也太逆天了\n点评：荒诞反差强烈。\n\n"
-            "成员：乙\n语录：第二句\n点评：点评二。"
+        records = analyze_transcript.parse_featured_quotes_json(
+            '{"quotes": ['
+            '{"member": "甲", "quote": "这也太逆天了", "comment": "荒诞反差强烈。"},'
+            '{"member": "乙", "quote": "第二句", "comment": "点评二。"}]}'
         )
 
         self.assertEqual(
@@ -453,12 +460,22 @@ class FeaturedQuotesNormalizationTests(unittest.TestCase):
             ],
         )
 
-    def test_parses_member_name_label_variants(self) -> None:
-        """Models sometimes write 成员名称/语录名 labels; these must still parse."""
+    def test_parses_fenced_json_quotes(self) -> None:
+        """A code-fenced JSON body must still parse as pure JSON."""
 
-        records = analyze_transcript.parse_featured_quotes(
-            "成员名称：甲\n语录：这也太逆天了\n点评：荒诞反差强烈。\n\n"
-            "成员名：乙\n语录名：第二句\n点评：点评二。"
+        records = analyze_transcript.parse_featured_quotes_json(
+            '```json\n{"quotes": [{"member": "甲", "quote": "语录", "comment": "点评"}]}\n```'
+        )
+
+        self.assertEqual(records, [("甲", [("语录", "点评")])])
+
+    def test_parses_chinese_field_label_variants(self) -> None:
+        """Models sometimes emit 成员/语录/点评 keys; these must still parse."""
+
+        records = analyze_transcript.parse_featured_quotes_json(
+            '{"quotes": ['
+            '{"成员": "甲", "语录": "这也太逆天了", "点评": "荒诞反差强烈。"},'
+            '{"成员名": "乙", "语录名": "第二句", "comment": "点评二。"}]}'
         )
 
         self.assertEqual(
@@ -469,88 +486,179 @@ class FeaturedQuotesNormalizationTests(unittest.TestCase):
             ],
         )
 
-    def test_groups_flat_list_items_by_member(self) -> None:
-        """Legacy flat bullet output must regroup all quotes per member."""
+    def test_groups_same_member_quotes_into_one_section(self) -> None:
+        """Repeated entries of one member must regroup under a single section."""
 
-        records = analyze_transcript.parse_featured_quotes(
-            "- **甲**\n  > 第一条语录\n\n- **点评**：点评一。\n\n"
-            "- **乙**\n  > 第二条语录\n\n- **点评**：点评二。\n\n"
-            "- **甲**\n  > 第三条语录\n\n- **点评**：点评三。"
+        records = analyze_transcript.parse_featured_quotes_json(
+            '{"quotes": ['
+            '{"member": "甲", "quote": "第一条", "comment": "点评一"},'
+            '{"member": "乙", "quote": "第二条"},'
+            '{"member": "甲", "quote": "第三条", "comment": "点评三"}]}'
         )
 
         self.assertEqual(
             records,
             [
-                (
-                    "甲",
-                    [("第一条语录", "点评一。"), ("第三条语录", "点评三。")],
-                ),
-                ("乙", [("第二条语录", "点评二。")]),
+                ("甲", [("第一条", "点评一"), ("第三条", "点评三")]),
+                ("乙", [("第二条", None)]),
             ],
         )
 
-    def test_groups_bold_names_inside_blockquotes(self) -> None:
-        """Blockquote-first output must still split quotes per member."""
+    def test_allows_empty_quotes_array(self) -> None:
+        """An empty quotes array is valid and must parse to no records."""
 
-        records = analyze_transcript.parse_featured_quotes(
-            "### 精选语录\n\n> **甲**\n> 第一条语录\n\n- **点评**：点评一。\n\n"
-            "> **乙**\n> 第二条语录\n\n- **点评**：点评二。"
-        )
+        self.assertEqual(analyze_transcript.parse_featured_quotes_json('{"quotes": []}'), [])
 
-        self.assertEqual(
-            records,
-            [
-                ("甲", [("第一条语录", "点评一。")]),
-                ("乙", [("第二条语录", "点评二。")]),
-            ],
-        )
+    def test_rejects_plain_text_quote_output(self) -> None:
+        """The unlabeled 成员/语录/点评 regression must fail validation outright."""
 
-    def test_drops_member_without_parsable_quote(self) -> None:
-        """A member heading with no quote text must not produce an empty card."""
+        with self.assertRaises(analyze_transcript.FeaturedQuotesFormatError):
+            analyze_transcript.parse_featured_quotes_json(
+                "成员\n甲\n语录\n2命等于0命的2.5倍\n点评\n讽刺拉满"
+            )
 
-        records = analyze_transcript.parse_featured_quotes(
-            "### 甲\n\n### 乙\n> 唯一语录\n\n- **点评**：点评。"
-        )
+    def test_rejects_json_without_quotes_array(self) -> None:
+        """A JSON object without a quotes array must fail validation."""
 
-        self.assertEqual(records, [("乙", [("唯一语录", "点评。")])])
+        with self.assertRaises(analyze_transcript.FeaturedQuotesFormatError):
+            analyze_transcript.parse_featured_quotes_json('{"items": []}')
 
-    def test_returns_no_records_when_nothing_parses(self) -> None:
-        """Unrecognized output must parse to nothing so the raw text is kept."""
+    def test_rejects_quote_item_without_quote_text(self) -> None:
+        """Entries missing the required member or quote text must fail validation."""
 
-        self.assertEqual(
-            analyze_transcript.parse_featured_quotes("模型自由发挥的普通段落。"), []
-        )
+        with self.assertRaises(analyze_transcript.FeaturedQuotesFormatError):
+            analyze_transcript.parse_featured_quotes_json(
+                '{"quotes": [{"member": "甲", "comment": "只有点评"}]}'
+            )
 
-    def test_document_renders_quote_structure_itself(self) -> None:
-        """The document must hardcode per-member headings from parsed records."""
+    def test_document_embeds_formatted_quotes_unchanged(self) -> None:
+        """The document must embed code-formatted quote markdown verbatim."""
 
+        formatted = "### 甲\n\n> 语录一\n\n- **点评**：点评一。"
         analysis = analyze_transcript.build_analysis_document(
             member_count=2,
             portraits=("### 甲\n- 简洁概括",),
-            featured_quotes=(
-                "- **甲**\n  > 语录一\n\n- **点评**：点评一。\n\n"
-                "- **乙**\n  > 语录二\n\n- **点评**：点评二。"
-            ),
+            featured_quotes=formatted,
         )
 
         quotes_section = analysis[analysis.index("## 语录精选") :]
-        self.assertEqual(
-            quotes_section,
-            "## 语录精选\n\n### 甲\n\n> 语录一\n\n- **点评**：点评一。\n\n"
-            "### 乙\n\n> 语录二\n\n- **点评**：点评二。",
-        )
+        self.assertEqual(quotes_section, f"## 语录精选\n\n{formatted}")
 
-    def test_document_keeps_raw_quotes_when_parsing_fails(self) -> None:
-        """Unparsable quote output must fall back to the raw model text."""
+    def test_document_omits_quotes_section_without_valid_quotes(self) -> None:
+        """校验失败被丢弃的语录精选不得在报告中占位。"""
 
-        raw = "模型自由发挥的普通段落。"
         analysis = analyze_transcript.build_analysis_document(
             member_count=1,
             portraits=("### 甲\n- 简洁概括",),
-            featured_quotes=raw,
+            featured_quotes="",
         )
 
-        self.assertIn(f"## 语录精选\n\n{raw}", analysis)
+        self.assertNotIn("语录精选", analysis)
+
+    def test_analyze_featured_quotes_formats_valid_json_response(self) -> None:
+        """A valid JSON response must come back as code-built quote markdown."""
+
+        transcript = "## 2026-09-12 09:00:00 · 群\n\n> **甲**\n>\n> 消息0\n"
+        response = '{"quotes": [{"member": "甲", "quote": "消息0", "comment": "测试。"}]}'
+
+        with patch.object(
+            analyze_transcript, "request_portraits", return_value=(response, None)
+        ):
+            result = analyze_transcript.analyze_featured_quotes(
+                transcript,
+                quote_count=5,
+                base_url="https://example.test",
+                model="test-model",
+                api_key="test-key",
+                max_tokens=100,
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(result, "### 甲\n\n> 消息0\n\n- **点评**：测试。")
+
+    def test_analyze_featured_quotes_drops_output_failing_json_validation(self) -> None:
+        """A non-JSON response must be dumped under temp/ and dropped from the report."""
+
+        transcript = "## 2026-09-12 09:00:00 · 群\n\n> **甲**\n>\n> 消息0\n"
+        raw_response = "成员\n甲\n语录\n消息0\n点评\n讽刺拉满"
+
+        output = StringIO()
+        with (
+            patch.object(
+                analyze_transcript,
+                "request_portraits",
+                return_value=(raw_response, None),
+            ),
+            redirect_stdout(output),
+        ):
+            result = analyze_transcript.analyze_featured_quotes(
+                transcript,
+                quote_count=5,
+                base_url="https://example.test",
+                model="test-model",
+                api_key="test-key",
+                max_tokens=100,
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(result, "")
+        printed = output.getvalue()
+        self.assertIn("未通过 JSON 格式校验", printed)
+        dump_paths = list(
+            analyze_transcript.TRACE_DIRECTORY.glob("*_语录精选_json校验失败.md")
+        )
+        matching = [
+            path
+            for path in dump_paths
+            if raw_response in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(len(matching), 1)
+        dumped = matching[0].read_text(encoding="utf-8")
+        self.assertIn("test-model", dumped)
+        self.assertIn(str(matching[0].resolve()), printed)
+
+    def tearDown(self) -> None:
+        analyze_transcript.llm_cache.uninstall()
+
+    def test_analyze_featured_quotes_evicts_rejected_response_from_cache(self) -> None:
+        """The poisoned cache entry must miss on rerun after a validation failure."""
+
+        transcript = "## 2026-09-12 09:00:00 · 群\n\n> **甲**\n>\n> 消息0\n"
+        raw_response = "这不是 JSON。"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            analyze_transcript.llm_cache.install(
+                analyze_transcript.llm_cache.LlmResponseCache(Path(tmp))
+            )
+            cache = analyze_transcript.llm_cache.active()
+            assert cache is not None
+            key = analyze_transcript.llm_cache.cache_key(
+                stage_label="语录精选",
+                base_url="https://example.test",
+                model="test-model",
+                max_tokens=100,
+                prompt=analyze_transcript.build_featured_quotes_prompt(
+                    transcript, quote_count=5
+                ),
+            )
+            cache.store(key, raw_response, None)
+
+            with patch.object(
+                analyze_transcript,
+                "request_portraits",
+                return_value=(raw_response, None),
+            ):
+                analyze_transcript.analyze_featured_quotes(
+                    transcript,
+                    quote_count=5,
+                    base_url="https://example.test",
+                    model="test-model",
+                    api_key="test-key",
+                    max_tokens=100,
+                    timeout_seconds=1,
+                )
+
+            self.assertIsNone(cache.lookup(key))
 
 
 class AnalysisDocumentTests(unittest.TestCase):
@@ -619,7 +727,7 @@ class PromptTests(unittest.TestCase):
         self.assertIn("表达特点、持续关注点及在群内的互动方式", prompt)
 
     def test_requests_high_quality_group_quotes(self) -> None:
-        """The quote prompt must follow the requested humorous and provocative criteria."""
+        """The quote prompt must demand strict JSON and keep the curation criteria."""
 
         prompt = analyze_transcript.build_featured_quotes_prompt(
             "## 2026-09-11 09:00:00 · 测试群\n\n> **甲**\n>\n> 一条发言",
@@ -628,14 +736,27 @@ class PromptTests(unittest.TestCase):
 
         self.assertIn("幽默、讽刺或“逆天”程度", prompt)
         self.assertIn("精选 8 条", prompt)
-        self.assertIn("行首标签必须是「成员」「语录」「点评」", prompt)
-        self.assertIn("成员：<该成员在记录中的名称>", prompt)
-        self.assertIn("语录：<发言原文>", prompt)
-        self.assertIn("点评：<点评内容>", prompt)
-        self.assertIn("不要使用任何 Markdown 标记", prompt)
+        self.assertIn(
+            '{"quotes": [{"member": "<该成员在记录中的名称>", '
+            '"quote": "<发言原文>", "comment": "<点评内容>"}]}',
+            prompt,
+        )
         self.assertIn("QQ 表情", prompt)
-        self.assertIn("从展示语录中去除", prompt)
+        self.assertIn("从 quote 中去除", prompt)
         self.assertIn("去除后没有文字内容的发言不得入选", prompt)
+
+    def test_ends_featured_quotes_prompt_with_hard_json_constraint(self) -> None:
+        """The hard JSON constraint must close the prompt so it cannot be diluted."""
+
+        prompt = analyze_transcript.build_featured_quotes_prompt(
+            "## 2026-09-11 09:00:00 · 测试群\n\n> **甲**\n>\n> 一条发言",
+            quote_count=8,
+        )
+
+        self.assertIn("硬性格式约束", prompt)
+        self.assertIn("json.loads", prompt)
+        self.assertIn("禁止使用 Markdown 代码块标记", prompt)
+        self.assertTrue(prompt.rstrip().endswith("不会进入报告。"))
 
     def test_requests_cautious_fixed_group_overview(self) -> None:
         """The overview prompt must remain grounded in completed portraits."""
@@ -1619,8 +1740,11 @@ class TruncationChoiceTests(unittest.TestCase):
         def fake_request(prompt: str, **kwargs: object) -> tuple[str, str | None]:
             captured_limits.append(kwargs.get("max_tokens"))  # type: ignore[arg-type]
             if len(captured_limits) == 1:
-                return "部分语录", "length"
-            return "完整语录内容", None
+                return '{"quotes": [{"member": "甲", "quote": "部分语', "length"
+            return (
+                '{"quotes": [{"member": "甲", "quote": "完整语录内容", "comment": "点评。"}]}',
+                None,
+            )
 
         with patch.object(
             analyze_transcript, "request_portraits", side_effect=fake_request
@@ -1637,7 +1761,7 @@ class TruncationChoiceTests(unittest.TestCase):
                 timeout_seconds=1,
             )
 
-        self.assertEqual(quotes, "完整语录内容")
+        self.assertEqual(quotes, "### 甲\n\n> 完整语录内容\n\n- **点评**：点评。")
         self.assertEqual(captured_limits, [100, None])
 
     def test_truncated_output_ends_program_when_user_quits(self) -> None:
@@ -1865,7 +1989,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         report = discussion_analysis.analyze_discussion_minutes(
             source,
             maximum_topics=5,
-            maximum_input_characters=500,
+            maximum_input_characters=2000,
             request_text=scripted_request,
         )
         self.assertEqual([topic.title for topic in report.topics], ["话题甲"])
@@ -1884,7 +2008,7 @@ class DiscussionMinutesTests(unittest.TestCase):
                 index,
                 timestamp.replace(hour=9 + index),
                 "甲" if index % 2 == 0 else "乙",
-                f"消息{index}包含较长的讨论内容便于触发分块",
+                f"消息{index}包含较长的讨论内容便于触发分块" * 14,
                 "",
             )
             for index in range(6)
@@ -1932,7 +2056,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         report = discussion_analysis.analyze_discussion_minutes(
             source,
             maximum_topics=5,
-            maximum_input_characters=500,
+            maximum_input_characters=2000,
             request_text=scripted_request,
             maximum_workers=3,
         )
@@ -2272,11 +2396,13 @@ class DiscussionMinutesTests(unittest.TestCase):
         self.assertIn("主要参与者名单：王小明、李雷", named)
         self.assertIn("逐一提及", named)
         self.assertIn("概括性转述", named)
+        self.assertIn("未达成结论时也要概括各方观点与讨论走向", named)
         self.assertNotIn("按时间顺序", named)
 
         plain = discussion_analysis._minutes_instruction("议题", partial=False)
         self.assertIn("逐一提及", plain)
         self.assertIn("概括性转述", plain)
+        self.assertIn("未达成结论时也要概括各方观点与讨论走向", plain)
         self.assertNotIn("主要参与者名单", plain)
         self.assertIn("压缩归纳为一段最终纪要", plain)
 
@@ -2340,6 +2466,26 @@ class DiscussionMinutesTests(unittest.TestCase):
             unchanged,
         )
 
+    def test_truncate_minutes_falls_back_to_prefix_when_sentences_do_not_fit(self) -> None:
+        """A giant sentence plus a vacuous tail keeps the content prefix, not the tail."""
+
+        body = (
+            "张三先阐述了升级后的界面变化与性能表现，"
+            + "中间补充了大量操作细节与对比数据，" * 16
+            + "李四认为流畅度提升最为明显。"
+        )
+        tail = "本次讨论未形成统一结论，各方仅分享了自身了解到的相关信息与观点。"
+        paragraph = body + tail
+        self.assertEqual(len(discussion_analysis._split_complete_sentences(paragraph)), 2)
+        self.assertGreater(len(body), discussion_analysis.MAX_MINUTES_CHARACTERS)
+
+        truncated = discussion_analysis.truncate_minutes(
+            paragraph, expected=("张三", "李四")
+        )
+        self.assertEqual(len(truncated), discussion_analysis.MAX_MINUTES_CHARACTERS)
+        self.assertIn("张三", truncated)
+        self.assertNotIn("未形成统一结论", truncated)
+
     def test_summarize_topic_partial_retry_uses_participants_for_coverage(self) -> None:
         moment = datetime(2026, 9, 11, 9, 0)
         messages = {
@@ -2395,7 +2541,7 @@ class DiscussionMinutesTests(unittest.TestCase):
         result = discussion_analysis.summarize_topic(
             candidate,
             messages_by_id=messages,
-            maximum_characters=510,
+            maximum_characters=545,
             request_text=scripted_request,
             participants=("王小明",),
         )
@@ -2633,7 +2779,11 @@ class DiscussionMinutesTests(unittest.TestCase):
         timestamp = datetime(2026, 9, 11, 9, 0)
         source = tuple(
             contextual_analysis.TranscriptMessage(
-                index, timestamp.replace(hour=9 + index), "甲", f"消息{index}内容", ""
+                index,
+                timestamp.replace(hour=9 + index),
+                "甲",
+                f"消息{index}内容" + "补充讨论细节。" * 75,
+                "",
             )
             for index in range(6)
         )
@@ -2697,7 +2847,7 @@ class DiscussionMinutesTests(unittest.TestCase):
             report = discussion_analysis.analyze_discussion_minutes(
                 source,
                 maximum_topics=5,
-                maximum_input_characters=500,
+                maximum_input_characters=2000,
                 request_text=scripted_request,
             )
 
@@ -2906,7 +3056,7 @@ class DiscussionMinutesTests(unittest.TestCase):
             report = discussion_analysis.analyze_discussion_minutes(
                 source,
                 maximum_topics=5,
-                maximum_input_characters=500,
+                maximum_input_characters=600,
                 request_text=scripted,
             )
 
